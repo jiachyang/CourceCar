@@ -191,13 +191,23 @@ public:
 
 ---
 
-## 待用户批准
+## 实现状态（已批准并完成）
 
-本方案覆盖需求清单 rev.3 的全部 CONFIRMED 项。若批准，下一步将：
-1. 在 `Car/` 下新建 PROS 工程；
-2. 按上表实现模块与 `main` 真值配置表；
-3. 编译并给出 T-01～T-12 的硬件测试记录模板。
+用户已下达「开始按照计划进行」，实现已落地：
 
-**在收到「批准实施」之前，不创建/修改任何 C++ 代码或 PROS 工程。**
+| 文件 | 内容 |
+| --- | --- |
+| `include/chassis/chassis_config.hpp` | 模块内部真值参数（端口/几何/传动/符号/限幅/PID） |
+| `include/chassis/math_util.hpp` | `wrapToPi` / `clampd` |
+| `include/chassis/kinematics.hpp` + `src/chassis/kinematics.cpp` | 纯数学 IK |
+| `include/chassis/chassis_drive.hpp` + `src/chassis/chassis_drive.cpp` | 四电机驱动、饱和、slew、刹车 |
+| `include/chassis/imu_sensor.hpp` + `src/chassis/imu_sensor.cpp` | IMU 校准与航向读取 |
+| `include/chassis/heading_controller.hpp` + `src/chassis/heading_controller.cpp` | 航向 PID、主动旋转旁路 |
+| `include/chassis/chassis.hpp` + `src/chassis/chassis.cpp` | 门面 `drive()` |
+| `src/main.cpp` | 整车真值配置表 + 演示 |
+| `tests/native/test_kinematics.cpp` + `scripts/test_native.sh` | 主机端 IK 单测 |
+| `docs/TEST_PLAN.md` | T-01～T-12 测试/标定记录模板 |
 
-STATUS: WAITING_FOR_DESIGN_APPROVAL
+验证：`bash scripts/test_native.sh` 通过；`pros make` 无警告，生成 `bin/hot.package.bin`。
+
+STATUS: IMPLEMENTED_PENDING_HARDWARE_TEST
