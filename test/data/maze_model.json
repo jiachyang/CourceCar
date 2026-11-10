@@ -1,0 +1,222 @@
+{
+  "grid": {
+    "cols": 8,
+    "rows": 8,
+    "cell_size_m": 0.45,
+    "coordinate_origin": "top-left",
+    "x_direction": "right",
+    "y_direction": "down"
+  },
+  "note": "Physical walls approximate center-lines of the 45 cm panel grid. Marker icons are not drawn to scale.",
+  "sites": {
+    "S": {
+      "cell": [
+        4,
+        7
+      ],
+      "center_m_from_top_left": [
+        2.025,
+        3.375
+      ]
+    },
+    "F": {
+      "cell": [
+        3,
+        0
+      ],
+      "center_m_from_top_left": [
+        1.575,
+        0.225
+      ]
+    },
+    "A": {
+      "cell": [
+        0,
+        3
+      ],
+      "center_m_from_top_left": [
+        0.225,
+        1.575
+      ]
+    },
+    "B": {
+      "cell": [
+        5,
+        4
+      ],
+      "center_m_from_top_left": [
+        2.475,
+        2.025
+      ]
+    },
+    "C": {
+      "cell": [
+        3,
+        2
+      ],
+      "center_m_from_top_left": [
+        1.575,
+        1.125
+      ]
+    }
+  },
+  "fixed_vertical_segments": [
+    {
+      "x": 3,
+      "y_start": 0,
+      "y_end": 1
+    },
+    {
+      "x": 1,
+      "y_start": 1,
+      "y_end": 2
+    },
+    {
+      "x": 2,
+      "y_start": 2,
+      "y_end": 3
+    },
+    {
+      "x": 4,
+      "y_start": 0,
+      "y_end": 4
+    },
+    {
+      "x": 5,
+      "y_start": 1,
+      "y_end": 2
+    },
+    {
+      "x": 6,
+      "y_start": 0,
+      "y_end": 1
+    },
+    {
+      "x": 6,
+      "y_start": 2,
+      "y_end": 4
+    },
+    {
+      "x": 7,
+      "y_start": 1,
+      "y_end": 5
+    },
+    {
+      "x": 3,
+      "y_start": 3,
+      "y_end": 5
+    },
+    {
+      "x": 2,
+      "y_start": 5,
+      "y_end": 7
+    },
+    {
+      "x": 5,
+      "y_start": 5,
+      "y_end": 6
+    },
+    {
+      "x": 4,
+      "y_start": 6,
+      "y_end": 7
+    },
+    {
+      "x": 1,
+      "y_start": 6,
+      "y_end": 8
+    },
+    {
+      "x": 3,
+      "y_start": 7,
+      "y_end": 8
+    },
+    {
+      "x": 5,
+      "y_start": 7,
+      "y_end": 8
+    },
+    {
+      "x": 6,
+      "y_start": 5,
+      "y_end": 7
+    }
+  ],
+  "fixed_horizontal_segments": [
+    {
+      "y": 1,
+      "x_start": 1,
+      "x_end": 3
+    },
+    {
+      "y": 2,
+      "x_start": 2,
+      "x_end": 4
+    },
+    {
+      "y": 2,
+      "x_start": 5,
+      "x_end": 7
+    },
+    {
+      "y": 3,
+      "x_start": 0,
+      "x_end": 1
+    },
+    {
+      "y": 3,
+      "x_start": 4,
+      "x_end": 5
+    },
+    {
+      "y": 4,
+      "x_start": 1,
+      "x_end": 3
+    },
+    {
+      "y": 4,
+      "x_start": 5,
+      "x_end": 6
+    },
+    {
+      "y": 5,
+      "x_start": 3,
+      "x_end": 5
+    },
+    {
+      "y": 6,
+      "x_start": 2,
+      "x_end": 5
+    },
+    {
+      "y": 6,
+      "x_start": 7,
+      "x_end": 8
+    },
+    {
+      "y": 7,
+      "x_start": 6,
+      "x_end": 7
+    }
+  ],
+  "movable_segments": {
+    "M1": {
+      "orientation": "V",
+      "position": 1,
+      "start": 3,
+      "end": 4
+    },
+    "M2": {
+      "orientation": "V",
+      "position": 5,
+      "start": 4,
+      "end": 5
+    },
+    "M3": {
+      "orientation": "H",
+      "position": 5,
+      "start": 6,
+      "end": 7
+    }
+  }
+}

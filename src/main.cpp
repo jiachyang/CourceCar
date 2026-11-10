@@ -1,85 +1,149 @@
 /**
  * @file src/main.cpp
- * @brief X-Drive 底盘入口：整车真值配置表 + 最小调用示例。
+ * @brief 应用调度层（Application）：初始化模块、组织数据流、管理 PROS 生命周期。
  *
- * ARCH-010：main 只放**整车级**配置（模块开关）；端口、传动比等在 chassis 模块内部。
- * 需求清单见 docs/chassis_requirements.md（rev.3），设计见 docs/chassis_design.md。
+ * 架构（详见 docs/architecture.md）：
+ *   main 只负责“调用哪个模块、传入什么命令、读取什么状态、按什么顺序执行”，
+ *   不包含逆运动学、电机写值、IMU 读取、摇杆映射、遥测格式或标定流程。
+ *
+ * 应用层分工：
+ *   - diag::Telemetry  —— 只读状态快照，输出 $P / $D / $S 串口帧；
+ *   - bringup          —— 台架调试（静摩擦标定、点动自检），不进入正常控制。
+ *
+ * 数据流：
+ *   Radio ──► core::MotionCommand ──► LaneKeeper(vx/vy 纠偏) ──► Chassis ──► 四轮电机
+ *   IMU   ──► core::HeadingState  ──► Chassis（航向 PID，ω 修正仍由 Chassis 完成）
+ *   DistanceArray ──► core::RangeSnapshot ──► LaneKeeper（墙体状态/双墙/单墙 PID）
+ *   *State ──► diag::Telemetry    ──► 串口遥测
  */
 #include "main.h"
 
 #include <cstdio>
 
-#include "chassis/chassis.hpp"
+#include "bringup/friction_test.hpp"
+#include "config/robot_config.hpp"
+#include "core/types.hpp"
+#include "diag/telemetry.hpp"
+#include "modules/chassis.hpp"
+#include "modules/distance_array.hpp"
+#include "modules/imu.hpp"
+#include "modules/lane_keeper.hpp"
+#include "modules/radio.hpp"
+#include "pros/rtos.hpp"
 
 namespace {
 
-/// 整车真值配置表（ARCH-009 / ARCH-010）：运行时可改，无需重编译。
-struct VehicleConfig {
-    bool enableChassisDrive = true;   ///< 底盘驱动模块
-    bool enableImuHeading   = false;  ///< IMU 航向模块：未装未测，默认关（IMU-021）
-    bool enableSlewLimit    = true;   ///< 加减速限制（DRV-006）
-};
+/// 整车级真值配置（ARCH-009/010）：只放模块开关，硬件参数在模块内部。
+config::VehicleConfig g_vehicle;
 
-VehicleConfig g_vehicle;
+// 各模块实例：唯一硬件管理者，生命周期贯穿整个程序。
 chassis::Chassis g_chassis;
+imu::Imu g_imu;
+radio::Radio g_radio;
+distance::DistanceArray g_distance;
+lane::LaneKeeper g_lane;
 
-/// 把整车开关同步到各模块（运行时开关，ARCH-009）。
-void syncConfig() {
-    g_chassis.enableDrive     = g_vehicle.enableChassisDrive;
-    g_chassis.enableImuHeading = g_vehicle.enableImuHeading;
-    g_chassis.enableSlewLimit  = g_vehicle.enableSlewLimit;
+// 遥测输出器：只读上面各模块的状态快照。
+diag::Telemetry g_telemetry;
+
+/// 把整车开关同步到模块（运行时开关，改 g_vehicle 即生效）。
+void syncVehicleConfig() {
+    g_chassis.enableDrive       = g_vehicle.enableChassisDrive;
+    g_chassis.enableHeadingHold = g_vehicle.enableImuHeading;
+    g_chassis.enableSlewLimit   = g_vehicle.enableSlewLimit;
+    g_lane.enable               = g_vehicle.enableLaneAssist;
 }
 
-/// 最小调用示例：低速依次演示 T-01～T-06（真实测试前请把驱动轮架空）。
-void runDemoSequence() {
-    struct Step {
-        double vx, vy, omega;
-        std::uint32_t ms;
-        const char *name;
-    };
-    const Step plan[] = {
-        { 0.20,  0.00,  0.00, 800, "T-01 fwd"},
-        {-0.20,  0.00,  0.00, 800, "T-02 back"},
-        { 0.00,  0.20,  0.00, 800, "T-03 left"},
-        { 0.00, -0.20,  0.00, 800, "T-04 right"},
-        { 0.00,  0.00,  0.50, 800, "T-05 ccw"},
-        { 0.20,  0.20,  0.50, 800, "T-06 mix"},
-    };
-
-    for (const auto &s : plan) {
-        std::printf("[chassis] %s\n", s.name);
-        const std::uint32_t t0 = pros::millis();
-        while (pros::millis() - t0 < s.ms) {
-            syncConfig();
-            g_chassis.drive(s.vx, s.vy, s.omega);
-            pros::delay(20);  // 控制周期 20 ms（CTRL-007）
-        }
-        g_chassis.stop();
-        pros::delay(300);
+/// 一个控制周期的调度：传感器 → 遥控 → 数据传递 → 底盘执行。
+void runControlCycle(double dt) {
+    // 1) 更新传感器（IMU 默认关，未装未测时不影响底盘）
+    if (g_vehicle.enableImu) {
+        g_imu.update();
     }
-    std::printf("[chassis] demo done\n");
+    g_distance.update();  // 四路测距：供 LaneKeeper 与遥测使用
+
+    // 2) 采集遥控输入（失联/超时时 state.valid=false）
+    g_radio.update();
+
+    // 3) 数据传递：航向状态 → 底盘；遥控基础命令 → LaneKeeper → 底盘
+    //    底盘只认 core::HeadingState，不知道航向来自 IMU 还是别的源。
+    g_chassis.setHeadingState(g_imu.toHeadingState());
+
+    core::MotionCommand base = core::zeroMotion();
+    if (g_vehicle.enableRadioControl && g_radio.getState().valid &&
+        g_radio.isCommandFresh()) {
+        base = g_radio.getDriveCommand();
+    }
+
+    // 车道保持只修改 vx/vy；omega 原样透传，航向 PID 仍在 Chassis 内。
+    g_lane.update(base, g_distance.toRangeSnapshot(),
+                  g_imu.toHeadingState(), dt);
+    g_chassis.setCommand(g_lane.getState().command);
+
+    // 4) 底盘执行（航向修正 + IK + 电机下发全在模块内部）
+    g_chassis.update(dt);
 }
 
 }  // namespace
 
 void initialize() {
-    std::printf("[chassis] boot\n");
-    g_chassis.initialize();
-    syncConfig();
+    std::printf("[app] boot\n");
+
+    // 模块初始化：每个模块只 init 一次，配置只来自统一配置入口。
+    g_chassis.init(chassis::makeDefaultChassisConfig());
+    g_imu.init(imu::makeDefaultImuConfig());
+    g_radio.init(radio::makeDefaultRadioConfig());
+    g_distance.init(distance::makeDefaultDistanceConfig());
+    g_lane.init(lane::makeDefaultLaneConfig());
+
+    if (g_vehicle.enableImu) {
+        g_imu.startCalibration();
+    }
+    syncVehicleConfig();
+
+    // 遥测只读上述状态快照；指针在模块生命周期内保持稳定。
+    diag::TelemetrySources sources;
+    sources.chassis  = &g_chassis.getState();
+    sources.imu      = &g_imu.getState();
+    sources.radio    = &g_radio.getState();
+    sources.distance = &g_distance.getState();
+    sources.lane     = &g_lane.getState();
+    g_telemetry.init(diag::makeDefaultTelemetryConfig(), sources);
 }
 
-void disabled() {}
+void disabled() {
+    // 禁用期间必须确保底盘停止，不得保留上一帧动作。
+    g_chassis.stop();
+    g_lane.reset();  // 清车道 PID/组/墙体确认历史，避免重新使能时复用旧状态
+}
 
 void competition_initialize() {}
 
 void autonomous() {
-    runDemoSequence();
+    // 暂无自主任务：保留点动自检，方便架空车轮验证方向（T-01~T-06）。
+    bringup::runStaticTestSequence(g_chassis);
 }
 
 void opcontrol() {
-    // 本阶段暂无手柄映射；直接复用演示序列，方便手动触发观察。
-    runDemoSequence();
+    // 台架模式：只跑静摩擦标定，不进入遥控循环（开关见 bringup/friction_test.hpp）。
+    if (bringup::kFrictionTestEnabled) {
+        bringup::runFrictionTest(g_chassis, g_imu);
+        g_chassis.stop();
+        return;
+    }
+
+    std::uint32_t tick = pros::millis();
+    std::uint32_t lastMs = 0;
     while (true) {
-        pros::delay(20);
+        const std::uint32_t now = pros::millis();
+        const double dt = (lastMs == 0) ? 0.02 : (now - lastMs) / 1000.0;
+        lastMs = now;
+
+        syncVehicleConfig();
+        runControlCycle(dt);
+        g_telemetry.update();
+
+        // 固定 20ms 周期（CTRL-007）：delay_until 避免 delay 累加误差。
+        pros::Task::delay_until(&tick, 20);
     }
 }

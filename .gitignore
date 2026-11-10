@@ -20,6 +20,11 @@ logs/
 *.swp
 .DS_Store
 
+# --- Python ---
+__pycache__/
+*.py[cod]
+
 # --- 临时文件 ---
 *.tmp
 *.bak
+.tmp-pi-*

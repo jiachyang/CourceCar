@@ -11,10 +11,20 @@ namespace chassis {
 
 class ChassisDrive {
 public:
-    ChassisDrive();
+    /// 构造四个电机（端口来自 config），并设为 brake 模式（DRV-007）。
+    explicit ChassisDrive(const ChassisConfig& config);
 
-    /// 下发四轮目标 RPM（顺序 FL,FR,RL,RR）。内部处理方向符号、饱和、slew。
-    void applyWheelRpm(const double rpm[kWheelCount], bool enableSlew);
+    /**
+     * 下发四轮目标 RPM（顺序 FL,FR,RL,RR）。内部处理方向符号、饱和、slew。
+     * @param rpm         IK 输出的目标转速
+     * @param enableSlew  是否启用加减速限制
+     * @param outApplied  输出最终下发的转速（用于状态上报），可为 nullptr
+     */
+    void applyWheelRpm(const double rpm[kWheelCount], bool enableSlew,
+                       double outApplied[kWheelCount]);
+
+    /// 读取四轮实测转速 [rpm]。
+    void readWheelRpm(double out[kWheelCount]);
 
     /// 刹车（DRV-010：独立函数，当前 brake 模式，日后可整体替换）。
     void stop();
@@ -23,6 +33,7 @@ public:
     bool allMotorsInstalled();
 
 private:
+    ChassisConfig config_{};
     pros::Motor motors_[kWheelCount];  ///< 顺序 FL,FR,RL,RR
     double lastCmd_[kWheelCount];      ///< 上一周期指令，用于 slew
 };

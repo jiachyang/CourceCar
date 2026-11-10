@@ -1,6 +1,6 @@
 # VEX V5 四全向轮 X-Drive 底盘 — 需求检查清单
 
-> 状态：**需求已确认（rev.3）**，待用户批准进入设计/实现。
+> 状态：**需求已确认（rev.8）**，当前接线与朝向见 `docs/车辆配置.md`。
 > 对齐基准：本文件是后续需求修改的**唯一基准**。修改时按 ID 更新，不要重述整套系统。
 > 字段：`ID` / `需求` / `当前值` / `状态` / `来源` / `待确认`
 > 状态定义：`CONFIRMED`（用户明确或文档可靠定义）/ `INFERRED`（推导或经验，未确认）/ `UNKNOWN`（缺信息）/ `CONFLICT`（来源冲突）
@@ -9,6 +9,13 @@
 > - rev.1：初版需求清单。
 > - rev.2：并入第一批回答（轮径 10 cm、直驱、200 rpm、IMU 端口 5、20 ms、PID…）。
 > - rev.3：并入 §M 全部回答，**所有问题已闭环**。本阶段范围＝底盘驱动 + IMU 航向**框架**（链路打通、默认关闭、运行时开关）。
+> - rev.4：修正硬件端口——IMU 改接 Smart Port 11（HW-005 / IMU-019），新增 V5 Robot Radio 端口 Smart Port 5（HW-010）。
+> - rev.5：更新当前接线——IMU 改接 **Smart Port 6**；新增四路激光测距 **7=前、8=后、9=左、10=右**；明确车头为 **+x 向 +y 偏 45°**。
+> - rev.5.1：IMU 绕竖直轴旋转安装——**车头 = IMU +x 向 +y 偏 45°**，代码增加 `mountingYawOffsetRad = +π/4`。
+> - rev.6：加入方向相关静摩擦前馈（实测 +0.361 / −0.221 rad/s），仅接近静止且误差超过 0.5° 时启用。
+> - rev.7：加入四距离传感器自适应车道保持（LaneKeeper）；10/15 cm 滞回、双墙/单墙 PID、
+>   测距组选择、`core::RangeSnapshot` 契约；默认关闭，安装几何/PID 待标定。
+> - rev.8：TOO_CLOSE 连续远离（<20 mm 不卡故障/不停止）；双墙走廊门控（双侧 <150 mm 才纠偏，停车保持模式）；遥测 30 个车道字段；加入 `test/lane_plot.py` 实时 UI。
 
 ## 0. 资料与来源索引
 
@@ -17,7 +24,8 @@
 | README | 本项目 `README`（任务书） |
 | docs-底盘 | `docs/底盘数据.md` |
 | docs-电机 | `docs/电机数据-P1空载-P3装轮.md` |
-| docs-测距 | `docs/测距仪数据-P2.md` |
+| docs-测距 | `docs/测距仪数据-P2.md`（历史 P2 单传感器数据） |
+| **docs-车辆配置** | **`docs/车辆配置.md`（当前接线、轮位与车头朝向真值）** |
 | 图片 | `docs/image/底盘数据/1792127597173.png`（俯视示意图，已确认即实物布局） |
 | 用户 | 用户在 `待确认` 列与 §M 的直接回答 |
 | 推导 | 由 README/docs/用户输入计算得出 |
@@ -35,7 +43,7 @@
 | PRJ-005 | 使用的 PROS Kernel / CLI 版本 | CLI 3.5.6；参考工程用 Kernel 4.2.2 | INFERRED | 现场检查 / docs-电机 | 目标是否固定 4.2.2 |
 | PRJ-006 | 是否复用/参考现有 `mazecar` 工程 | **可参考，但代码须符合现要求** | CONFIRMED | 用户 Q-09 | — |
 | PRJ-007 | 版本管理 | **本地 Git 仓库即可**（已在 `Car/` 初始化并提交） | CONFIRMED | 用户 Q-10 | — |
-| PRJ-008 | 本阶段实现范围 | **底盘驱动 + IMU 航向框架**；IMU→底盘链路打通但默认关闭；每模块可单独启用 | CONFIRMED | 用户 Q-07 | — |
+| PRJ-008 | 本阶段实现范围 | **底盘驱动 + IMU 航向 + 四距离车道保持**；IMU→底盘链路已打通；量产建议默认关闭，本次测试临时打开；每模块可单独启用 | CONFIRMED | 用户 Q-07 / docs-车辆配置 | 车道安装几何/PID 待标定 |
 
 ## B. 硬件（HW）
 
@@ -43,13 +51,16 @@
 | --- | --- | --- | --- | --- | --- |
 | HW-001 | 驱动电机数量 | 4 台 VEX 电机 | CONFIRMED | README | — |
 | HW-002 | 驱动电机端口 | Smart Port 1～4 | CONFIRMED | README | — |
-| HW-003 | 端口号与车轮编号的物理映射 | **1=FL(左上)、2=RL(左下)、3=FR(右上)、4=RR(右下)** | CONFIRMED | 用户 Q-01 | — |
+| HW-003 | 端口号与车轮编号的物理映射 | **1=FL(左前)、2=RL(左后)、3=FR(右前)、4=RR(右后)** | CONFIRMED | 用户 Q-01 / docs-车辆配置 | — |
 | HW-004 | 姿态传感器 | VEX Inertial Sensor（IMU） | CONFIRMED | README | — |
-| HW-005 | IMU 端口 | Smart Port 5 | CONFIRMED | 用户 | 安装朝向待实测，见 IMU-019 |
-| HW-006 | 测距传感器 | P2 一个 V5 Distance Sensor | CONFIRMED | docs-测距 | 本阶段不使用，仅登记 |
+| HW-005 | IMU 端口 | **Smart Port 6** | CONFIRMED | 用户 / docs-车辆配置 | 安装朝向见 IMU-019（车头与 IMU +x 相差 45°） |
+| HW-006 | 测距传感器布置与端口 | **4 × V5 Distance Sensor：7=正前、8=正后、9=左、10=右** | CONFIRMED | 用户 / docs-车辆配置 | 经 `core::RangeSnapshot` 进入 LaneKeeper；安装几何待标定，见 LANE-003 |
 | HW-007 | 电机齿箱配置 | 四台与 docs 台账一致 = green / 200 rpm | CONFIRMED | 用户 / docs-电机 | — |
 | HW-008 | 齿箱「配置值」与「实物颜色」是否一致 | **暂按 docs 台账 green/200 计算**，实物颜色日后核对 | CONFIRMED | 用户 Q-02 | 日后可补 |
 | HW-009 | 电机上报 gearing / reversed | 四台同一型号（gearing=1，reversed=0） | CONFIRMED | 用户 / docs-电机 | — |
+| HW-010 | V5 Robot Radio 端口 | Smart Port 5 | CONFIRMED | 用户 | 模式 A（pros::Controller），端口仅登记 |
+
+> 完整接线表（含空闲端口与代码映射）见 `docs/车辆配置.md`。
 
 ## C. 机械结构（ME）
 
@@ -89,6 +100,7 @@
 | CS-007 | vy 正方向 | 车体左侧（左） | CONFIRMED | README | — |
 | CS-008 | omega 正方向 | 俯视逆时针 | CONFIRMED | README | — |
 | CS-009 | 运动控制坐标系 | 仅车体坐标系，不要求世界坐标系 | CONFIRMED | README | — |
+| CS-010 | 车头在框架边长坐标中的朝向 | **+x 正方向向 +y 正方向偏 45°**（等价于沿前后对角线） | CONFIRMED | 用户 / docs-车辆配置 | 不改变车体 +X=车头、+Y=左侧 |
 
 ## E. 运动学（KIN）
 
@@ -154,9 +166,10 @@
 | IMU-016 | 切换时避免速度突变 | 要求 | CONFIRMED | README | 平滑方式设计阶段定 |
 | IMU-017 | 角度跨越 0/360° 处理 | 用最短角差 | CONFIRMED | 用户 | — |
 | IMU-018 | 修正角速度如何叠加到 IK 输入 | PID 输出的修正角速度叠加到 omega | CONFIRMED | 用户 | 限幅方式设计阶段定 |
-| IMU-019 | IMU 端口与安装朝向 | 端口 5；安装朝向待实测（目前仅框架） | CONFIRMED（朝向待实测） | 用户 | 实测后补 |
+| IMU-019 | IMU 端口与安装朝向 | **端口 6**；IMU 绕竖直轴旋转安装，**车头 = IMU +x 向 +y 偏 45°**；`mountingYawOffsetRad = +π/4` | CONFIRMED | 用户 / docs-车辆配置 | 若实际在 +x 顺时针侧改 −π/4，见 docs-车辆配置 |
 | IMU-020 | 不要求 EKF、不要求 IMU 积分定位 | 是 | CONFIRMED | README | — |
-| IMU-021 | 实现「IMU→航向修正→底盘」完整链路但默认关闭 | 因 IMU 未测未装，先打通链路、运行时开关默认关，不影响底盘 | CONFIRMED | 用户 Q-07 | — |
+| IMU-021 | 实现「IMU→航向修正→底盘」完整链路并保留运行时开关 | 已接端口 6，链路已通；当前 `enableImu` / `enableImuHeading` 均开，可随时关闭 | CONFIRMED | 用户 Q-07 / docs-车辆配置 | — |
+| IMU-022 | 旋转静摩擦前馈 | 方向相关：err>0 → **+0.361 rad/s**；err<0 → **−0.221 rad/s**；仅当 `|gz|≤0.05 rad/s` 且 `|err|>0.0087 rad` 时加到 PID 输出 | CONFIRMED | 用户 / 2026-10-24 实测 | 换地面/电池后可重测 |
 
 ## I. 状态估计边界（EST）
 
@@ -182,6 +195,35 @@
 | ARCH-009 | 每个模块可**单独启用/停用** | **运行时开关**（不改代码、不重编译） | CONFIRMED | 用户 Q-07 | — |
 | ARCH-010 | `main` 中提供集中的「真值配置表」 | **只放整车级内容**（模块开关等）；**端口、传动比等放各模块内部** | CONFIRMED | 用户 Q-08 | — |
 
+## LANE. 四距离传感器自适应车道保持（LANE）
+
+> 状态：实现 + 主机模拟测试完成；**未上机验证**。设计详见 `docs/lane_keeping.md`。
+
+| ID | 需求 | 当前值 | 状态 | 来源 | 待确认 |
+| --- | --- | --- | --- | --- | --- |
+| LANE-001 | 四路 V5 Distance Sensor 接入车道保持 | 端口 7/8/9/10，经 `core::RangeSnapshot` | CONFIRMED | 用户 / docs-车辆配置 | 安装几何未实测 |
+| LANE-002 | 逻辑分组 A=S0+S2、B=S1+S3 | 默认 S0=前、S1=左、S2=后、S3=右；A=前后、B=左右 | CONFIRMED（逻辑） | 用户任务书/示意图 | 物理朝向见 LANE-003 |
+| LANE-003 | 每个传感器的端口/车体位置/轴向/遮挡映射 | `LaneConfig::sensors[]`；顶点半径 0.1803 m；`layoutVerified=false` | UNKNOWN | 用户任务书 | 必须实测 |
+| LANE-004 | 墙体存在性 10/15 cm 滞回 + 连续 3 次确认 | enter 严格 <100、exit 严格 >150；100–150（含端点）保持 | CONFIRMED | 用户 | 禁止改 5 cm |
+| LANE-005 | 无效读数不得确认“无墙” | 9999/超量程/<20/PROS_ERR/未安装都无效；打断计数，超过 stale 才 Unknown；持续 9999/超量程可独立作为“无可观测近墙”证据进入 NO_WALL/单墙 | CONFIRMED | 用户任务书 §5.4/§13 | — |
+| LANE-006 | 双墙居中 + 单墙跟随 + IMU 航向 PID + 状态机 | 统一墙距 PID；状态机 DISABLED/ACQUIRING/DUAL/LEFT/RIGHT/NO_WALL/TURNING/FAULT/TOO_CLOSE；航向 PID 复用 Chassis | CONFIRMED | 用户 | — |
+| LANE-007 | 最终输出 vx/vy/omega，由现有 IK 分配 | LaneKeeper 只改 vx/vy；omega 由 Chassis 航向 PID | CONFIRMED | 用户 | — |
+| LANE-008 | 组选择由目标平移方向+传感器轴决定，不依赖转弯次数 | 车体坐标 `t=(-dy,dx)`；45° 斜向不硬选；回差/驻留 | CONFIRMED | 用户 | — |
+| LANE-009 | 切换组不得复用上一组 PID 状态 | 组/模式/转弯/故障/TOO_CLOSE 切换 reset 积分与 D | CONFIRMED | 用户 | — |
+| LANE-010 | 两侧无墙不得虚构测量 | `NO_WALL`，纠偏 0，基础命令透传 | CONFIRMED | 用户 | — |
+| LANE-011 | 复用 maze_model.json 作为模拟真值 | `test/data/maze_model.json` -> fixture -> 射线/走廊测试 | CONFIRMED | 用户 / 文件 | — |
+| LANE-012 | 模块化、可主机测试、main 只调度 | 纯逻辑 LaneKeeper；main 149 行 | CONFIRMED | 开发规范 | — |
+| LANE-013 | 默认安全状态 | 量产建议 `enableLaneAssist=false`；本次实车测试临时 true | TEST | 开发规范/用户 | 测完决定 |
+| LANE-014 | PID 初值 | Kp/Kd 占位、Ki=0 | INFERRED | 用户任务书 | 待整定 |
+| LANE-015 | 传感器在四顶点、非轮子 45° 边中点 | 顶点半径 0.255/√2 ≈ 0.1803 m；轴沿 ±X/±Y | CONFIRMED | 用户/示意图 | 实际支架外伸待测 |
+| LANE-016 | 单墙目标 | `targetWallMm=45`（原始距离，非中心到墙 225 mm） | CONFIRMED | 用户任务书 §16 | 实车标定 |
+| LANE-017 | 测距滤波 | 3 点中值 + 可配低通 + 跳变连续确认 + 无距离复位 | CONFIRMED | 用户 §12 | 参数待调 |
+| LANE-018 | 积分门控 | 仅正常墙模式 + 原始对应墙距严格 <100 + Ki≠0；滞回冻结；切换清零；抗饱和 | CONFIRMED | 用户 §9 | — |
+| LANE-019 | 转弯/无墙/故障 | 转弯暂停墙距 PID；无墙不纠偏；持续读取失败/未安装进 SENSOR_FAULT 并减速/停止；过近走 TOO_CLOSE 远离 | CONFIRMED | 用户 §6/§13 | 阈值待调 |
+| LANE-020 | 前向安全 | 轴对齐传感器原始距离 <120 停、120–300 减速；斜向为盲区 | INFERRED | 用户 §13.5 | 实车标定 |
+| LANE-021 | 过近连续远离 | 单/双侧 <20 mm 连续确认 -> TOO_CLOSE；单侧远离、双侧按差居中；速度比例 0.35；不判故障/不停车；恢复后回正常墙模式 | CONFIRMED（逻辑）/未上机 | 用户 2026-10 反馈 | 阈值/方向待实车 |
+| LANE-022 | 双墙走廊长时间门控 | 两侧物理原始距离都 <150 mm 才启用；门外 reason=corridor-inactive、速度×1、不纠偏；门内停车也保持双墙模式/PID，并以 ≤80 mm/s 自动居中/远离 | CONFIRMED（逻辑）/未上机 | 用户 2026-10 反馈 | 门限/自动速度待实车 |
+
 ## K. 测试与验收（TEST）
 
 | ID | 测试 | 预期行为 | 状态 | 来源 |
@@ -206,7 +248,7 @@
 | ID | 需求 | 当前值 | 状态 | 来源 |
 | --- | --- | --- | --- | --- |
 | EXT-001 | 轮式里程计 | 后续 | CONFIRMED | README |
-| EXT-002 | 测距仪融合 | 后续（P2 传感器已存在） | CONFIRMED | README / docs-测距 |
+| EXT-002 | 测距仪融合 | 局部车道保持已接入（LaneKeeper，vx/vy 纠偏）；定位/EKF 融合仍后续 | CONFIRMED | README / docs-车辆配置 |
 | EXT-003 | 位置估计（x/y） | 后续 | CONFIRMED | README |
 
 ---
@@ -229,7 +271,7 @@
 | --- | --- | --- | --- | --- |
 | X-01 | 缺口 | 原始照片缺失 → 以示意图为准 | ME-019 / ME-020 | **已解决** |
 | X-02 | 未知 | 齿箱配置值与实物颜色 → 暂按 docs green/200 | HW-008 | **已解决（暂定）** |
-| X-03 | 未知 | 端口↔轮、轮子正转方向 → 已定；IMU 朝向待实测 | HW-003 / KIN-004 / IMU-019 | **基本解决** |
+| X-03 | 未知 | 端口↔轮、轮子正转方向 → 已定；IMU 安装朝向已定为 +45° | HW-003 / KIN-004 / IMU-019 | **已解决** |
 | X-04 | 未知 | 轮半径与传动比 → 0.05 m、直驱 | ME-007 / ME-008 | **已解决** |
 | X-05 | 待确认 | 本阶段是否含 IMU → 含框架，默认关闭 | PRJ-008 / IMU-021 | **已解决** |
 
@@ -241,6 +283,9 @@
 
 ### Q-01 端口↔轮的读法确认（HW-003 / X-03）
 我的回答：对 → **1=左上/F、2=左下/RL、3=右上/FR、4=右下/RR**
+
+> 按车体前后左右的最新叫法：图中的左上/左下/右上/右下 = **左前(FL)/左后(RL)/右前(FR)/右后(RR)**；
+> 当前真值以 `docs/车辆配置.md` 为准。
 
 ### Q-02 齿箱「配置值」与「实物颜色」（HW-008 / X-02）
 我的回答：先按目前实测的 docs 中的电机计算 → **暂用 green/200**
