@@ -1,6 +1,6 @@
 # VEX V5 四全向轮 X-Drive 底盘 — 需求检查清单
 
-> 状态：**需求已确认（rev.8）**，当前接线与朝向见 `docs/车辆配置.md`。
+> 状态：**需求已确认（rev.9）**，当前接线与朝向见 `docs/车辆配置.md`。
 > 对齐基准：本文件是后续需求修改的**唯一基准**。修改时按 ID 更新，不要重述整套系统。
 > 字段：`ID` / `需求` / `当前值` / `状态` / `来源` / `待确认`
 > 状态定义：`CONFIRMED`（用户明确或文档可靠定义）/ `INFERRED`（推导或经验，未确认）/ `UNKNOWN`（缺信息）/ `CONFLICT`（来源冲突）
@@ -16,6 +16,7 @@
 > - rev.7：加入四距离传感器自适应车道保持（LaneKeeper）；10/15 cm 滞回、双墙/单墙 PID、
 >   测距组选择、`core::RangeSnapshot` 契约；默认关闭，安装几何/PID 待标定。
 > - rev.8：TOO_CLOSE 连续远离（<20 mm 不卡故障/不停止）；双墙走廊门控（双侧 <150 mm 才纠偏，停车保持模式）；遥测 30 个车道字段；加入 `test/lane_plot.py` 实时 UI。
+> - rev.9：对齐 `LaneKeeping_V2_1_RangeAware`——远距回波=有效测量（FAR_RETURN 不是无墙）、100–150 mm 可初始化、LaneKeeper 只输出横向 delta、PD 参数更新、前向安全拆到独立 SafetySupervisor。
 
 ## 0. 资料与来源索引
 
@@ -197,32 +198,34 @@
 
 ## LANE. 四距离传感器自适应车道保持（LANE）
 
-> 状态：实现 + 主机模拟测试完成；**未上机验证**。设计详见 `docs/lane_keeping.md`。
+> 状态：v2.1 实现 + 主机测试完成；**未上机验证**。设计详见 `docs/lane_keeping.md`。
 
 | ID | 需求 | 当前值 | 状态 | 来源 | 待确认 |
 | --- | --- | --- | --- | --- | --- |
 | LANE-001 | 四路 V5 Distance Sensor 接入车道保持 | 端口 7/8/9/10，经 `core::RangeSnapshot` | CONFIRMED | 用户 / docs-车辆配置 | 安装几何未实测 |
 | LANE-002 | 逻辑分组 A=S0+S2、B=S1+S3 | 默认 S0=前、S1=左、S2=后、S3=右；A=前后、B=左右 | CONFIRMED（逻辑） | 用户任务书/示意图 | 物理朝向见 LANE-003 |
 | LANE-003 | 每个传感器的端口/车体位置/轴向/遮挡映射 | `LaneConfig::sensors[]`；顶点半径 0.1803 m；`layoutVerified=false` | UNKNOWN | 用户任务书 | 必须实测 |
-| LANE-004 | 墙体存在性 10/15 cm 滞回 + 连续 3 次确认 | enter 严格 <100、exit 严格 >150；100–150（含端点）保持 | CONFIRMED | 用户 | 禁止改 5 cm |
-| LANE-005 | 无效读数不得确认“无墙” | 9999/超量程/<20/PROS_ERR/未安装都无效；打断计数，超过 stale 才 Unknown；持续 9999/超量程可独立作为“无可观测近墙”证据进入 NO_WALL/单墙 | CONFIRMED | 用户任务书 §5.4/§13 | — |
-| LANE-006 | 双墙居中 + 单墙跟随 + IMU 航向 PID + 状态机 | 统一墙距 PID；状态机 DISABLED/ACQUIRING/DUAL/LEFT/RIGHT/NO_WALL/TURNING/FAULT/TOO_CLOSE；航向 PID 复用 Chassis | CONFIRMED | 用户 | — |
-| LANE-007 | 最终输出 vx/vy/omega，由现有 IK 分配 | LaneKeeper 只改 vx/vy；omega 由 Chassis 航向 PID | CONFIRMED | 用户 | — |
-| LANE-008 | 组选择由目标平移方向+传感器轴决定，不依赖转弯次数 | 车体坐标 `t=(-dy,dx)`；45° 斜向不硬选；回差/驻留 | CONFIRMED | 用户 | — |
-| LANE-009 | 切换组不得复用上一组 PID 状态 | 组/模式/转弯/故障/TOO_CLOSE 切换 reset 积分与 D | CONFIRMED | 用户 | — |
-| LANE-010 | 两侧无墙不得虚构测量 | `NO_WALL`，纠偏 0，基础命令透传 | CONFIRMED | 用户 | — |
+| LANE-004 | 近壁分类 10/15 cm + 连续 3 帧确认 | `<100` 连续 3 帧=`NEAR_RETURN`；`>150` 连续 3 帧=`FAR_RETURN`（有效远距回波，不是无墙）；100–150 连续 3 帧首次可进入 `MID_RETURN` | CONFIRMED（v2.1） | 用户 / LaneKeeping_V2_1 | 阈值/确认帧待实车 |
+| LANE-005 | 无效读数不得确认“无墙” | 9999/超量程/PROS_ERR/未安装/过近都不确认无墙；短时保留旧估计，`maxAge=180 ms` 后转 `UNKNOWN`；原始 `RangeSnapshot` 不被修改 | CONFIRMED（v2.1） | 用户 / LaneKeeping_V2_1 | — |
+| LANE-006 | 双墙横向居中 + 过近排斥 | 两侧 `NEAR/MID`、距离 <150 mm、几何宽度 0.37–0.70 m -> `TRACKING`；`<20 mm` -> `TOO_CLOSE`；不再做单墙跟随 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | 宽度/PD 待实车 |
+| LANE-007 | LaneKeeper 只输出横向 delta | `command = base + laneDelta`；不改变巡航速度、不输出 speedScale、不做前向急停；`omega` 透传 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | — |
+| LANE-008 | 稳定通道方向选对 | 前后运动用 S1/S3，横移用 S0/S2；`t=(-dy,dx)`；`score=max(|tx|,|ty|) < 0.82` 不选；停车沿用最后一次方向；无方向且静止时按物理左右/前后墙回退选对 | CONFIRMED（v2.1 + 实车回退） | LaneKeeping_V2_1 | 实车方向/安装待测 |
+| LANE-009 | 换对不得复用控制历史 | 换对清 PD 微分历史并丢弃上一对 hold 窗口；丢墙 150 ms 内按时间缓释旧纠偏 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | — |
+| LANE-010 | 无可信双墙不得虚构测量 | `NO_PAIR/INSUFFICIENT_DATA/NO_CORRIDOR` 时不新增纠偏；旧纠偏按变化率回 0；原始远距回波仍有效 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | — |
 | LANE-011 | 复用 maze_model.json 作为模拟真值 | `test/data/maze_model.json` -> fixture -> 射线/走廊测试 | CONFIRMED | 用户 / 文件 | — |
-| LANE-012 | 模块化、可主机测试、main 只调度 | 纯逻辑 LaneKeeper；main 149 行 | CONFIRMED | 开发规范 | — |
-| LANE-013 | 默认安全状态 | 量产建议 `enableLaneAssist=false`；本次实车测试临时 true | TEST | 开发规范/用户 | 测完决定 |
-| LANE-014 | PID 初值 | Kp/Kd 占位、Ki=0 | INFERRED | 用户任务书 | 待整定 |
+| LANE-012 | 模块化、可主机测试、main 只调度 | 纯逻辑 LaneKeeper/SafetySupervisor；main 156 行 | CONFIRMED | 开发规范 | — |
+| LANE-013 | 默认安全状态 | `enableLaneAssist=true`、`enableSafety=true` 为本次测试临时值；标定前不得视为量产默认 | TEST | 开发规范/用户 | 测完决定 |
+| LANE-014 | PD 初值 | `Kp=0.0010`、`Ki=0`、`Kd=0.000025`、D 低通 0.12；输出 0.14 m/s、变化率 0.70 m/s² | INFERRED（v2.1） | LaneKeeping_V2_1 | 待整定 |
 | LANE-015 | 传感器在四顶点、非轮子 45° 边中点 | 顶点半径 0.255/√2 ≈ 0.1803 m；轴沿 ±X/±Y | CONFIRMED | 用户/示意图 | 实际支架外伸待测 |
-| LANE-016 | 单墙目标 | `targetWallMm=45`（原始距离，非中心到墙 225 mm） | CONFIRMED | 用户任务书 §16 | 实车标定 |
-| LANE-017 | 测距滤波 | 3 点中值 + 可配低通 + 跳变连续确认 + 无距离复位 | CONFIRMED | 用户 §12 | 参数待调 |
-| LANE-018 | 积分门控 | 仅正常墙模式 + 原始对应墙距严格 <100 + Ki≠0；滞回冻结；切换清零；抗饱和 | CONFIRMED | 用户 §9 | — |
-| LANE-019 | 转弯/无墙/故障 | 转弯暂停墙距 PID；无墙不纠偏；持续读取失败/未安装进 SENSOR_FAULT 并减速/停止；过近走 TOO_CLOSE 远离 | CONFIRMED | 用户 §6/§13 | 阈值待调 |
-| LANE-020 | 前向安全 | 轴对齐传感器原始距离 <120 停、120–300 减速；斜向为盲区 | INFERRED | 用户 §13.5 | 实车标定 |
-| LANE-021 | 过近连续远离 | 单/双侧 <20 mm 连续确认 -> TOO_CLOSE；单侧远离、双侧按差居中；速度比例 0.35；不判故障/不停车；恢复后回正常墙模式 | CONFIRMED（逻辑）/未上机 | 用户 2026-10 反馈 | 阈值/方向待实车 |
-| LANE-022 | 双墙走廊长时间门控 | 两侧物理原始距离都 <150 mm 才启用；门外 reason=corridor-inactive、速度×1、不纠偏；门内停车也保持双墙模式/PID，并以 ≤80 mm/s 自动居中/远离 | CONFIRMED（逻辑）/未上机 | 用户 2026-10 反馈 | 门限/自动速度待实车 |
+| LANE-016 | 走廊宽度判定 | `(left+right)/1000 + p_left·t + p_right·(-t)` 在 `[0.37,0.70] m`；45 cm 通道约 450.6 mm | INFERRED（v2.1） | LaneKeeping_V2_1 | 换场地重标 |
+| LANE-017 | 测距滤波 | 3 点中值 + 低通 alpha 0.45 + 60 mm 跳变连续 2 帧确认；`fresh=42 ms`、`maxAge=180 ms` | CONFIRMED（v2.1） | LaneKeeping_V2_1 | 噪声/刷新率待测 |
+| LANE-018 | 横向 PD 与复位 | 误差 `0.5*((right+q_right)-(left+q_left))`，向右为正；换对/重新可信/离开 TOO_CLOSE 复位 D；目标 0 也按变化率回 0 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | — |
+| LANE-019 | 模式机只决定横向行为 | `DISABLED/NO_PAIR/INSUFFICIENT_DATA/NO_CORRIDOR/TRACKING/DEGRADED/TOO_CLOSE`；不含转弯/故障速度比例 | CONFIRMED（v2.1） | LaneKeeping_V2_1 | — |
+| LANE-020 | 前向安全独立 | `SafetySupervisor` 在 LaneKeeper 之后、Chassis 之前；ToF 轴对齐 + 制动模型只缩小 vx/vy，omega 保持；配置非法 fail-closed | CONFIRMED（v2.1 逻辑）/未上机 | LaneKeeping_V2_1 | 制动距离/延迟待实测 |
+| LANE-021 | 过近排斥 | 单侧 `<20 mm` 以 0.10 m/s 远离；双侧按差居中并限幅 ±0.10 m/s；PD 旁路；不减速/不停车 | CONFIRMED（v2.1 逻辑）/未上机 | LaneKeeping_V2_1 | 静摩擦/方向待实车 |
+| LANE-022 | 长距 ToF / 近壁语义隔离 | 1.65 m/1.85 m 等远距回波是有效物理测量，标记 `FAR_RETURN`；LaneKeeper 不修改/截断 SensorFrame；定位应直接读原始 ToF | CONFIRMED（v2.1） | LaneKeeping_V2_1 | 定位模块尚未接入 |
+| LANE-023 | 航向门控在安全层 | `requireHeading=false` 默认不因 IMU 无效停车；置 true 时航向无效禁止平移，omega 仍可执行 | INFERRED（v2.1） | LaneKeeping_V2_1 | 实车策略待定 |
+| LANE-024 | 停车无方向/静摩擦补偿 | 无方向且静止时按墙对回退；`|error|>3 mm` 时给最小 0.08 m/s 横向速度；有平移速度时不叠加 | 新增/未上机 | 实车反馈 | 0.08 m/s 与死区待测 |
 
 ## K. 测试与验收（TEST）
 

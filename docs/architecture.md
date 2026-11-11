@@ -14,9 +14,9 @@
 ## 1. 项目总体架构
 
 重构目标：**main 负责组织，模块负责能力**。机器人被拆为三个控制模块
-（Radio / IMU / Chassis）、一个测距读取模块（DistanceArray）和一个局部车道保持
-模块（LaneKeeper）；每个模块拥有自己的配置、状态、初始化与更新接口；
-`main.cpp` 只做调度。
+（Radio / IMU / Chassis）、一个测距读取模块（DistanceArray）、一个局部横向
+车道保持模块（LaneKeeper）和一个安全限速模块（SafetySupervisor）；
+每个模块拥有自己的配置、状态、初始化与更新接口；`main.cpp` 只做调度。
 遥测（`diag`）与台架调试（`bringup`）放在应用层，只在 main 里各占一个调用点。
 
 ```
@@ -30,9 +30,12 @@
         │ body MotionCommand│ HeadingState     │
         ▼                  │                  │
    LaneKeeper ◄── core::RangeSnapshot ── DistanceArray（四路测距）
-   (WallTracker×4 / Group select / Dual+Single PID)
+   (RangeChannel×4 / 选对 / 横向 PD)
         │
-        │ body MotionCommand：vx/vy 修正，omega 透传
+        │ body MotionCommand：base + 横向 delta，omega 透传
+        ▼
+   SafetySupervisor（ToF 制动 / 航向门控）
+        │
         └──────────────────────────────────────────► Chassis
 
    应用层（不在控制链上）：
@@ -41,8 +44,9 @@
 ```
 
 - LaneKeeper 与 Chassis 都不直接碰对方内部：LaneKeeper 输出 `core::MotionCommand`，
-  Chassis 消费它并叠加 IMU 航向 PID。
-- 测距硬件仍只由 `DistanceArray` 读取；LaneKeeper 只消费 `core::RangeSnapshot`。
+  安全层限速后交给 Chassis，由 Chassis 叠加 IMU 航向 PID。
+- 测距硬件仍只由 `DistanceArray` 读取；LaneKeeper/安全层只消费
+  `core::RangeSnapshot`，不修改原始测量。
 
 - 这里“模块/节点”是**逻辑模块**，不是线程、进程或 ROS2 节点。
 - 更新为**单调度循环**：`main` 按固定顺序调用各模块，周期 20 ms。
@@ -59,13 +63,14 @@
 | ├ Kinematics | `include/chassis/kinematics.hpp`、`src/chassis/kinematics.cpp` | 纯数学 `(vx,vy,ω)` → 四轮 RPM | 否 |
 | ├ ChassisDrive | `include/chassis/chassis_drive.hpp`、`src/chassis/chassis_drive.cpp` | 方向符号、饱和、slew、刹车 | **是（电机）** |
 | └ HeadingController | `include/chassis/heading_controller.hpp`、`src/chassis/heading_controller.cpp` | 目标航向锁存、PID、主动旋转旁路 | 否 |
-| **LaneKeeper** | `include/modules/lane_keeper.hpp`、`src/modules/lane_keeper.cpp` | 滤波、墙体状态、组选择、状态机、双墙/单墙 PID、过近排斥、限速/前向安全、vx/vy 纠偏 | 否 |
-| ├ WallTracker | `include/lane/wall_state.hpp`、`src/lane/wall_state.cpp` | 单路 10/15 cm 滞回、连续确认、无效/超时 | 否 |
-| ├ RangeFilter | `include/lane/range_filter.hpp`、`src/lane/range_filter.cpp` | 3 点中值 + 低通 + 跳变确认 + 复位 | 否 |
-| ├ SensorGroupSelector | `include/lane/sensor_group_selector.hpp`、`src/lane/sensor_group_selector.cpp` | 前后 A/左右 B、左右映射、回差/驻留 | 否 |
-| ├ LaneStateMachine | `include/lane/lane_state_machine.hpp`、`src/lane/lane_state_machine.cpp` | ACQUIRING/TURNING/FAULT/TOO_CLOSE、积分权限、速度比例 | 否 |
-| ├ LanePid | `include/lane/pid.hpp`、`src/lane/pid.cpp` | 完整 P/I/D、积分门控、限幅、抗饱和、D 低通 | 否 |
-| └ LaneConfig | `include/lane/lane_config.hpp`、`src/lane/lane_config.cpp` | 顶点布局、阈值、滤波/PID/状态机初值、静态校验 | 否 |
+| **LaneKeeper** | `include/modules/lane_keeper.hpp`、`src/modules/lane_keeper.cpp` | 近壁通道、稳定方向选对、双墙可信判定、横向 PD/过近排斥；只输出横向 delta | 否 |
+| ├ RangeChannel | `include/lane/range_channel.hpp`、`src/lane/range_channel.cpp` | 单路有效回波、NEAR/MID/FAR 分类、中值/低通、新鲜度/超时 | 否 |
+| ├ SensorGroupSelector | `include/lane/sensor_group_selector.hpp`、`src/lane/sensor_group_selector.cpp` | 通道方向 -> 前后/左右对、左右映射 | 否 |
+| ├ LaneStateMachine | `include/lane/lane_state_machine.hpp`、`src/lane/lane_state_machine.cpp` | TRACKING/DEGRADED/TOO_CLOSE/NO_CORRIDOR/INSUFFICIENT/NO_PAIR | 否 |
+| ├ LanePid | `include/lane/pid.hpp`、`src/lane/pid.cpp` | PD（Ki=0）、限幅、D 低通、复位 | 否 |
+| └ LaneConfig | `include/lane/lane_config.hpp`、`src/lane/lane_config.cpp` | 顶点布局、近壁/滤波/PD/走廊/过近参数、静态校验 | 否 |
+| **SafetySupervisor** | `include/modules/safety_supervisor.hpp`、`src/modules/safety_supervisor.cpp` | 唯一安全限速出口：ToF 制动约束、可选航向门控、fail-closed | 否 |
+| └ SafetyConfig | `include/safety/safety_config.hpp`、`src/safety/safety_config.cpp` | 反应时间/制动减速度/ToF 余量/置信度/轴对齐 | 否 |
 | **IMU** | `include/modules/imu.hpp`、`src/modules/imu.cpp` | IMU 初始化 / 校准 / 读取 / 单位与坐标归一 | **是（IMU）** |
 | **Radio** | `include/modules/radio.hpp`、`src/modules/radio.cpp` | 遥控摇杆/按键读取、失联保护 | **是（Controller）** |
 | └ 摇杆映射 | `include/radio/input_mapping.hpp`、`src/radio/input_mapping.cpp` | 纯函数：归一化/死区/摇杆→`MotionCommand` | 否 |
@@ -183,33 +188,28 @@ public:
 ### 3.4 LaneKeeper（`lane` 命名空间）
 
 ```cpp
-enum class LaneState { DISABLED, ACQUIRING, DUAL_WALL, LEFT_WALL,
-                       RIGHT_WALL, NO_WALL, TURNING, SENSOR_FAULT, TOO_CLOSE };
+enum class LaneMode { DISABLED, NO_PAIR, INSUFFICIENT_DATA, NO_CORRIDOR,
+                      TRACKING, DEGRADED, TOO_CLOSE };
 
 struct LaneConfig {
     SensorConfig sensors[4];        // 顶点 S0..S3：rangeSource / x,y / 轴角
-    WallConfig wall;                // enter<100, exit>150, confirm=3
-    RangeFilterConfig filter;       // 中值 + 低通 + 跳变确认
-    PidConfig wallPid;              // 一个墙距 PID（Ki 默认 0）
-    LaneStateConfig state;          // 目标 45mm、状态/速度/前向安全参数
-    double minAxisAlignment;        // 0.90
-    // 组切换回差/驻留、测量保持、最大参考垂距 ...
+    RangeChannelConfig channel;     // 近壁 100/150、确认 3 帧、maxAge 180 ms、alpha .45
+    PidConfig pd;                   // Kp .001 / Ki 0 / Kd .000025
+    LaneStateConfig state;          // 走廊宽度 .37-.70 m、过近 20 mm、限幅 .14 m/s
+    bool layoutVerified;            // 安装几何是否实测
 };
 
 struct LaneKeeperState {
-    core::MotionCommand base, command;  // command 只改 vx/vy，omega 透传
-    LaneState state; LaneReason reason;
+    core::MotionCommand base, command;  // command = base + 横向 delta；omega 透传
+    LaneMode mode; LaneReason reason;
     int8_t group;                       // 0=A(前后), 1=B(左右), -1=未选
-    WallDebug walls[4];                 // raw/filtered/status/usable
-    bool leftObserved, rightObserved;
-    double leftDistanceMm, rightDistanceMm;   // 滤波原始距离
-    double leftReferenceM, rightReferenceM;   // 中心->墙参考垂距
-    double corridorWidthM; bool corridorWidthValid;
-    double targetWallMm, lateralErrorMm;      // 误差向右为正
-    PidDebug wallPid;
+    ChannelDebug channels[4];           // NearClass/raw/filtered/valid/fresh/age
+    bool leftValid, rightValid, corridor, corridorWidthValid, degraded, decay;
+    int leftSensor, rightSensor; double pairScore;
+    double leftMm, rightMm, centerErrorMm;  // 向右为正
+    PidDebug pd;
     double lateralTargetMps, lateralCorrectionMps;  // 向右为正
-    double stateSpeedScale, targetSpeedScale, speedScale, forwardSafetyScale;
-    bool turning, degraded, fault, stateChanged, groupChanged;
+    double corridorWidthM, quality;
     std::uint32_t transitionCount, timestampMs;
 };
 
@@ -226,25 +226,61 @@ public:
 ```
 
 - 输入是**车体坐标**基础命令 + `core::RangeSnapshot` + `core::HeadingState`；
-  不读取 PROS 设备。
+  不读取 PROS 设备，不修改原始测距快照。
 - 子模块：
-  - `SensorGroupSelector`：前后 A / 左右 B、左右映射、回差/驻留；
-  - `WallTracker`：10/15 cm 滞回、连续 3 次、无效样本/超时；
-  - `RangeFilter`：3 点中值 + 低通 + 跳变确认；
-  - `LaneStateMachine`：ACQUIRING/TURNING/FAULT/双/单/无墙、积分权限、速度比例；
-  - `Pid`：一个墙距 PID，积分只在对应原始距离严格 <100 时累计。
-- 组选择由目标平移方向与传感器轴决定，不依赖转弯次数；45° 斜向不硬选。
-- 墙距误差统一“向右为正”；命令用右法向映射回车体 vx/vy。
-- 默认 `corridorOnly=true`：物理左右原始距离都 `<150 mm` 才启用墙距控制；
-  门外仅监控、不纠偏（`ACQUIRING` + `corridor-inactive`，速度×1）；
-  门内即使基础速度为 0 也保持双墙模式/PID，并以 ≤80 mm/s 自动居中/远离；
-- `9999`/超量程/PROS_ERR/未安装都是无效样本，不确认 `wall_present=false`；
-  其中持续 9999/超量程作为“无可观测近墙”的独立证据（超时后 NO_WALL/单墙）；
-  `<20 mm` 的过近样本不丢，而是进入 TOO_CLOSE 主动远离（不是停住/故障）；
-  读取失败/未安装持续异常才进入 SENSOR_FAULT。
-- **不实现航向 PID**：`omega` 原样透传，Chassis 的既有 `HeadingController`
-  继续负责 IMU 航向保持。LaneKeeper 只读 `core::HeadingState` 的角速度用于
-  TURNING 判定。详见 `docs/lane_keeping.md`。
+  - `RangeChannel`：单路 `UNKNOWN/NEAR_RETURN/MID_RETURN/FAR_RETURN`；
+    `FAR_RETURN` 是有效远距回波，不是无墙；100–150 mm 连续 3 帧可进入
+    `MID_RETURN`；中值 + 低通 + 跳变确认；`maxAge=180 ms`、`fresh=42 ms`；
+  - `SensorGroupSelector`：由稳定通道方向选前后/左右对；45° 斜向（score<0.82）
+    不选；换对清 PD 历史；
+  - `LaneStateMachine`：只给模式/质量/是否缓释，不给速度比例；
+  - `LanePid`：横向 PD，默认 Ki=0。
+- 双墙可信：两侧有效回波、分类非 FAR/UNKNOWN、距离均 <150 mm、几何宽度
+  `[(left+right)/1000 + p_left·t + p_right·(-t)]` 在 `[0.37,0.70] m`。
+- 误差 `0.5*((right+q_right)-(left+q_left))`，向右为正；
+  过近 `<20 mm` 时单侧以 `0.10 m/s` 远离，双侧按差居中。
+- 丢墙后 `DEGRADED` 最多 150 ms 按时间缓释上次纠偏；目标为 0 时也按
+  `0.70 m/s²` 回到 0。
+- 组选择方向：当前工程用基础命令的非零平移方向，停车沿用最后一次方向；
+  没有方向时 `NO_PAIR`。未来路径层应传稳定通道切向量，而不是瞬时修正速度。
+- **不拥有速度**：LaneKeeper 不输出 `speedScale`、不做前向急停；
+  `omega` 原样透传，航向 PID 仍在 Chassis。
+- 详见 `docs/lane_keeping.md`。
+
+### 3.5 SafetySupervisor（`safety` 命名空间）
+
+```cpp
+struct SafetyConfig {
+    bool requireHeading = false;
+    double reactionS = 0.12, brakeMps2 = 1.2, tofReserveM = 0.022;
+    double minAxisAlignment = 0.85;
+    std::int32_t minConfidence = 8;
+};
+
+struct SafetyState {
+    core::MotionCommand requested, command;
+    bool limited, stopped, headingBlocked;
+    double scale, nearestMm;
+};
+
+class SafetySupervisor {
+public:
+    void init(const SafetyConfig& config);
+    void update(const core::MotionCommand& command,
+                const core::RangeSnapshot& ranges,
+                const core::HeadingState& heading);
+    void reset();
+    const SafetyState& getState() const;
+    bool enable = true;
+};
+```
+
+- 唯一安全限速出口；只缩小 `vx/vy`，不改变 `omega`。
+- 对与运动方向轴对齐（>=0.85）且置信度足够的 ToF 做制动距离约束；
+- `requireHeading=true` 时航向无效禁止平移；默认关闭，避免 IMU 未校准导致
+  整车不能动；
+- 配置非法时 fail-closed（停车）；
+- 当前不含地图扫掠/未知挡板置信边界，不能单独作为实机零碰撞保证。
 
 ---
 
@@ -253,9 +289,10 @@ public:
 | 结构体 | 生产者 | 消费者 | 含义 |
 | --- | --- | --- | --- |
 | `core::MotionCommand` | Radio / 自主逻辑 | Chassis | 车体三自由度运动目标（m/s, m/s, rad/s） |
-| `core::HeadingState` | Imu（或未来里程计/GPS） | Chassis / LaneKeeper | 航向 / 角速度快照（rad, rad/s）；LaneKeeper 只用角速度判 TURNING |
-| `core::RangeSnapshot` | DistanceArray | LaneKeeper / diag | 四路测距（前/后/左/右）+ 状态分类，近墙判断的公共契约 |
-| `lane::LaneKeeperState` | LaneKeeper | main / diag | 基础/最终命令、模式、组、墙体状态、PID 内部量 |
+| `core::HeadingState` | Imu（或未来里程计/GPS） | Chassis / LaneKeeper / SafetySupervisor | 航向 / 角速度快照（rad, rad/s） |
+| `core::RangeSnapshot` | DistanceArray | LaneKeeper / SafetySupervisor / diag | 四路测距（前/后/左/右）+ 状态分类；原始测量只读 |
+| `lane::LaneKeeperState` | LaneKeeper | main / diag | 基础/横向 delta、模式、选对、近壁分类、PD 内部量 |
+| `safety::SafetyState` | SafetySupervisor | main / diag | 限速前/后命令、速度比例、最近障碍 |
 | `imu::ImuState` | Imu | main / diag | 航向 + 校准/零偏/状态字等诊断量 |
 | `chassis::ChassisState` | Chassis | main / diag | 目标、实际命令、四轮各级输出、健康标志 |
 | `radio::RadioState` | Radio | main / diag | 摇杆、按键、映射命令、连接与新鲜度 |
@@ -273,7 +310,10 @@ public:
 ```
 Radio ──► RadioState.driveCommand (body MotionCommand) ─┐
                                                        ▼
-DistanceArray ──► core::RangeSnapshot ─────────► LaneKeeper (vx/vy 修正)
+DistanceArray ──► core::RangeSnapshot ─────────► LaneKeeper (横向 delta)
+                                                       │ base + delta
+                                                       ▼
+                                              SafetySupervisor (ToF 限速)
                                                        │ body MotionCommand
                                                        ▼
 IMU ──► ImuState ──► core::HeadingState ─────► Chassis.setHeadingState()
@@ -284,7 +324,8 @@ IMU ──► ImuState ──► core::HeadingState ─────► Chassis.s
 *State 快照 ──► diag::Telemetry ──► $P / $D / $S 帧（main 只调用 update()）
 ```
 
-> LaneKeeper 只修改平移分量；`omega` 由 Chassis 的既有航向 PID 产生。
+> LaneKeeper 只叠加横向 delta，不改变巡航速度；安全层只缩小平移分量。
+> `omega` 由 Chassis 的既有航向 PID 产生。
 > 未使能 LaneKeeper（`enableLaneAssist=false`）时，它原样透传基础命令。
 
 安全链路（任一环节失效即归零）：
@@ -293,9 +334,12 @@ IMU ──► ImuState ──► core::HeadingState ─────► Chassis.s
 遥控失联 / 命令超时 / Radio 非法值  → main 下发 core::zeroMotion()
 disabled()                          → Chassis.stop()
 IMU 无效                            → 航向修正自动旁路（不阻塞底盘）
-LaneKeeper 关闭/配置非法/无墙       → 原样透传基础命令（不虚构墙距）
+LaneKeeper 关闭/配置非法             → 原样透传基础命令（不虚构墙距）
 LaneKeeper 非有限命令               → 归零并标记 invalid
 LaneKeeper 测距读取失败             → 该侧转 Unknown/不可用，绝不当成“无墙”
+LaneKeeper 只输出横向 delta         → 前向停车交给 SafetySupervisor
+SafetySupervisor 正前/侧向障碍      → 按制动模型缩小 vx/vy，omega 保持
+SafetySupervisor 配置非法           → fail-closed 停车
 ```
 
 未来可扩展为：
@@ -305,6 +349,11 @@ IMU + Encoders + Lidar ──► Localization ──► MotionController ──�
 ```
 
 `MotionController` 只要产出 `core::MotionCommand`，即可替换 Radio，**无需改底盘**。
+
+原型验证：`src/sim/maze_nav_sim.html` 在浏览器中把 Localization + MotionController +
+27 信念挡板规划闭环起来，传感器/车辆参数取自本仓库配置；核心逻辑不依赖 DOM，
+可用 `node src/sim/test_sim.mjs` 主机自检。它是**主机端工具**，不参与固件构建，
+也不改变上面的数据流。移植边界见 `src/sim/README.md`。
 
 ---
 
@@ -321,8 +370,10 @@ IMU + Encoders + Lidar ──► Localization ──► MotionController ──�
 - LaneKeeper 的输入/输出都是**车体坐标**；世界坐标路径方向必须先经
   `lane::worldVelocityToBody(world, headingRad)` 旋转，不能把“世界方向”直接
   当“车体方向”做组选择。
-- LaneKeeper 内部墙距误差采用“向右为正”，最终用右法向 `r=(dY,-dX)` 映射回
-  车体 `vx/vy`；不修改 Chassis/IK 的 `+Y=左` 约定。
+- LaneKeeper 内部误差采用“向右为正”，最终用右法向 `-t` 映射回车体
+  `vx/vy`；不修改 Chassis/IK 的 `+Y=左` 约定。
+- 当前没有全局路径层，LaneKeeper 使用基础命令的非零平移方向；停车沿用
+  最后一次方向。未来接入路径规划时传入稳定通道切向量。
 
 ---
 
@@ -335,6 +386,7 @@ initialize():
     radio.init(makeDefaultRadioConfig())
     distance.init(makeDefaultDistanceConfig())
     lane.init(makeDefaultLaneConfig())
+    safety.init(makeDefaultSafetyConfig())
     if (enableImu) imu.startCalibration()
     syncVehicleConfig()
     telemetry.init(makeDefaultTelemetryConfig(), sources)  // 只绑定状态快照指针
@@ -345,15 +397,18 @@ opcontrol() 每 20 ms:
     radio.update()
     chassis.setHeadingState(imu.toHeadingState())
     base = radio.valid ? radio.getDriveCommand() : zero
-    lane.update(base, distance.toRangeSnapshot(),
-                imu.toHeadingState(), dt)               // 只改 vx/vy
-    chassis.setCommand(lane.getState().command)
+    ranges = distance.toRangeSnapshot()
+    lane.update(base, ranges, imu.toHeadingState(), dt)  // 只加横向 delta
+    safety.update(lane.getState().command, ranges,
+                  imu.toHeadingState())                  // 唯一安全限速
+    chassis.setCommand(safety.getState().command)
     chassis.update(dt)                 // 航向 PID + IK + 电机
     telemetry.update()                 // $P / $D / $S，内部按各自周期限频
 
 disabled():
     chassis.stop()
-    lane.reset()                       // 清 PID/组/墙体确认历史
+    lane.reset()                       // 清 PD/选对/近壁分类历史
+    safety.reset()                     // 清安全限速状态
 
 autonomous():
     bringup::runStaticTestSequence(chassis)   // T-01~T-06 点动自检（无自主任务时）
@@ -401,7 +456,8 @@ opcontrol()（台架模式，kFrictionTestEnabled=true）:
 | **新增** `include/core/types.hpp` 的 `core::HeadingState` | 航向的公共契约；`Chassis` 不再 include `modules/imu.hpp` |
 | **新增** `include/diag/telemetry.hpp` + `src/diag/telemetry.cpp` | `$P`/`$D`/`$S` 帧格式与字段表集中一处；main 不再含 printf 格式串 |
 | **新增** `include/bringup/friction_test.hpp` + `src/bringup/friction_test.cpp` | 静摩擦标定与点动自检移出 main；几何换算改用 `Chassis::config()` |
-| **新增** `include/modules/lane_keeper.hpp` + `src/modules/lane_keeper.cpp`、`include/lane/*` | 四距离传感器自适应车道保持：滤波、墙体状态机、组选择、状态机、双墙/单墙 PID、过近排斥、限速/前向安全；只改 vx/vy |
+| **新增** `include/modules/lane_keeper.hpp` + `src/modules/lane_keeper.cpp`、`include/lane/*` | v2.1 近壁通道、稳定方向选对、双墙可信判定、横向 PD/过近排斥；只输出横向 delta |
+| **新增** `include/modules/safety_supervisor.hpp` + `src/modules/safety_supervisor.cpp`、`include/safety/*` | 唯一安全限速出口：ToF 制动约束、可选航向门控、fail-closed |
 | **新增** `include/core/range_types.hpp` + `include/distance/range_status.hpp` | 跨模块测距契约与读数分类；DistanceArray 增 `toRangeSnapshot()` |
 | **删除** `chassis/chassis.hpp`、`chassis/imu_sensor.hpp`、`chassis/math_util.hpp` 及对应 `.cpp` | 职责已被顶层模块吸收 |
 
@@ -418,14 +474,16 @@ opcontrol()（台架模式，kFrictionTestEnabled=true）:
 - 模块之间不互相 include 头文件：`chassis.hpp` 只依赖 `core`（`MotionCommand` / `HeadingState`）。
 - 无公共可随意修改的硬件全局状态；配置有明确归属。
 - 无额外线程、继承体系或插件机制。
-- 车道保持不直接控制电机：只输出 `core::MotionCommand`，由 Chassis 的既有
-  航向 PID + IK + 驱动链路执行。
+- 车道保持不直接控制电机，也不拥有巡航速度：只输出 `core::MotionCommand`
+  的横向 delta，由安全层限速、Chassis 的既有航向 PID + IK + 驱动链路执行。
 - 编译：`pros make` 在 `-Wall -Wextra` 下无警告；单测：`bash scripts/test_native.sh`
-  （IK + 航向控制器 + 摇杆映射 + 测距分类 + 墙体状态机 + 测距滤波 + 组选择器 +
-  车道状态机 + Lane PID + LaneKeeper 模拟 + 真实迷宫射线 + 遥测字段契约）。
+  （IK + 航向控制器 + 摇杆映射 + 测距分类 + 近壁通道 + 选对器 +
+  车道模式机 + 横向 PD + LaneKeeper 模拟 + 安全层 + 真实迷宫射线 +
+  遥测字段契约）。
 - 遥测契约：`$P` 的 38 个载荷字段由 `DIAG_TUNE_FIELDS` 单点定义，字段数由
   `static_assert` 守住，顺序与 `test/pid_tune.py` 的 `FIELDS[1:]` 一致；
-  `$D` 追加的 30 个车道字段由 `kLaneFieldCount` 与
-  `test/distance_monitor.py` 的 `LANE_FIELDS` 守住；
+  `$D` 追加的 30 个车道字段 + 3 个安全字段分别由 `kLaneFieldCount` /
+  `kSafetyFieldCount` 与 `test/distance_monitor.py` 的 `LANE_FIELDS` /
+  `SAFETY_FIELDS` 守住；
   `scripts/check_telemetry_schema.py` 在 `scripts/test_native.sh` 中自动比对两侧。
 - 硬件行为验证见 `docs/TEST_PLAN.md`（当前仅完成理论 + 主机单测 + 编译验证）。

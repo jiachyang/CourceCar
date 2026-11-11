@@ -1,12 +1,13 @@
 /**
  * @file lane/sensor_group_selector.hpp
- * @brief 根据车体运动方向与已标定传感器轴，选择垂直测距组并映射左右传感器。
+ * @brief 按稳定通道方向选择前后/左右测距对，并映射运动左/右传感器。
  *
- * 规则（完整任务书 §14）：
- *   - 组轴必须与运动方向左/右法向近似平行；
- *   - 同组两轴必须近似反向；
- *   - 切换有分数回差 + 最短驻留；
- *   - 零速/主动转弯不选组（避免抖动，转弯后台重新获取）。
+ * v2.1 规则：
+ *   - 输入是**通道方向**（来自 RouteSegment 或 LaneKeeper 记住的最近平移方向），
+ *     不是每帧修正后的瞬时速度；避免纠偏改变法向、进而反复换组；
+ *   - 前后运动用左右传感器（Group B），横向运动用前后传感器（Group A）；
+ *   - 45° 斜向且法向匹配不足（默认 <0.82）不输出常规居中修正；
+ *   - 左右只由传感器轴在运动左法向 `t=(-dy,dx)` 上的投影符号决定。
  */
 #pragma once
 
@@ -16,12 +17,14 @@
 
 namespace lane {
 
-struct GroupSelection {
-    int group = -1;       ///< 0=A,1=B,-1=未选
-    int leftSensor = -1;  ///< 沿运动左法向的传感器
-    int rightSensor = -1; ///< 沿运动右法向的传感器
-    double score = 0.0;   ///< min(|a_i·t|)
-    bool changed = false; ///< 本周期是否发生组变化
+struct PairSelection {
+    bool valid = false;
+    int group = -1;        ///< 0=A(前后), 1=B(左右), -1=未选
+    int leftSensor = -1;   ///< 运动左法向的传感器
+    int rightSensor = -1;  ///< 运动右法向的传感器
+    double leftNormalX = 0.0;   ///< 运动左法向 t=(-dy,dx)
+    double leftNormalY = 0.0;
+    double score = 0.0;    ///< max(|t·传感器轴|)
 };
 
 class SensorGroupSelector {
@@ -30,30 +33,13 @@ public:
     void reset();
 
     /**
-     * @param vx,vy   车体坐标目标平移速度 [m/s]
-     * @param nowMs   当前时刻 [ms]
-     * @param turning 是否主动转弯（转弯时不选组）
+     * @param dirX,dirY 车体坐标通道方向（无需归一化）
+     * @param directionValid 是否已有可信通道方向
      */
-    GroupSelection select(double vx, double vy, std::uint32_t nowMs,
-                          bool turning);
-
-    int currentGroup() const { return currentGroup_; }
+    PairSelection select(double dirX, double dirY, bool directionValid) const;
 
 private:
-    struct Choice {
-        bool valid = false;
-        int group = -1;
-        int leftSensor = -1;
-        int rightSensor = -1;
-        double score = 0.0;
-    };
-
-    Choice evaluate(int group, double tX, double tY) const;
-
     LaneConfig config_{};
-    int currentGroup_ = -1;
-    std::uint32_t lastChangeMs_ = 0;
-    bool hasChange_ = false;
 };
 
 }  // namespace lane

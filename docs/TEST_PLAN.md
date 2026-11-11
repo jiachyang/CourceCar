@@ -33,14 +33,14 @@ bash scripts/test_native.sh
 | `test_heading_controller` | 主动旋转旁路、航向保持、跨零最短角差、限幅、切换不突跳 |
 | `test_radio_mapping` | 死区、重标定、三轴映射、invert 翻转、满杆缩放 |
 | `test_distance_status` | PROS_ERR / 9999 / <20 / >2000 / 未安装分类 |
-| `test_wall_tracker` | 10/15 cm 滞回、连续 3 次、滞回带、丢数、无目标、stale |
-| `test_range_filter` | 中值、低通、跳变确认、9999 不混入、超时复位 |
-| `test_sensor_group_selector` | 前后=A/左右=B、前进/后退/横移/斜向/零速/转弯 |
-| `test_lane_state_machine` | 双/单/无墙、组切换、转弯、故障恢复、积分权限、速度比例 |
-| `test_lane_pid` | P/I/D、积分门控、Ki=0、限幅、抗饱和、D 低通、复位 |
-| `test_lane_config` | 顶点布局、目标 45 mm、阈值/滤波/PID/状态机校验 |
-| `test_lane_keeper` | 双/单墙符号、映射、短墙、故障、积分、限速、前向安全 |
-| `test_maze_fixture` | 真实 maze_model.json 射线、S 点基准、45 cm 走廊双墙居中、M1/M2/M3 |
+| `test_range_channel` | 99/100/150/151、MID 初始化、1.65 m 远距有效、丢帧保持/超时、跳变、滤波 |
+| `test_sensor_group_selector` | 前后=A/左右=B、前进/后退/横移/斜向/换组 |
+| `test_lane_state_machine` | TRACKING/DEGRADED/TOO_CLOSE/NO_CORRIDOR/INSUFFICIENT/NO_PAIR、hold 衰减 |
+| `test_lane_pid` | P/D、限幅、D 低通、复位 |
+| `test_lane_config` | 顶点布局、100/150/3、MID、走廊宽度、PD/状态参数校验 |
+| `test_lane_keeper` | 横向符号、横移/倒车选对、远距回波、宽度、方向记忆、过近、丢墙缓释、无速度倍率 |
+| `test_safety_supervisor` | 前向/侧向制动、45° 盲区、低置信度、航向门控、fail-closed |
+| `test_maze_fixture` | 真实 maze_model.json 射线、S 点基准、45 cm 走廊双墙跟踪、M1/M2/M3 |
 
 - 运行日期：__________　结果：__________
 
@@ -158,30 +158,34 @@ pros make        # 期望：无 warning / 无 error，生成 bin/hot.package.bin
 - 连接诊断：固件 1 Hz 输出 `$S`（1～21 号端口类型）。脚本会显示
   “Distance 在 7/8/9/10”或具体插错端口；完全没有 Distance 则检查供电/智能线。
 
-### 4.6 车道保持（四路测距 + 双墙/单墙 PID）
+### 4.6 车道保持 v2.1（四路测距 + 双墙横向 PD + 安全层）
 
 > **前置**：先完成 4.5 的四路测距有效性检查与 `LaneConfig` 安装几何标定。
-> 车道保持默认关闭（`enableLaneAssist=false`）；标定完成前不要打开。
+> 当前 `enableLaneAssist=true`、`enableSafety=true` 是本次实车测试的临时值；标定完成前不要视为量产默认。
 > 所有项目当前为**未验证**。
 
 | ID | 测试 | 期望 | 实测 | 结论 |
 | --- | --- | --- | --- | --- |
 | L-01 | 四路测距原点位置/轴向量测 | 填入 `LaneConfig::sensors[]`，`layoutVerified=true` | | ☐ |
-| L-02 | 前进进入 45 cm 通道 | 组 B（左右），左右原始约 45 mm，3 帧内 Present，双墙 | | ☐ |
-| L-03 | 左移/右移 | 组 A（前后）；运动左侧=后/前，纠偏方向符合 | | ☐ |
-| L-04 | 倒车 | 组 B 但左右墙映射对调，纠偏不反向 | | ☐ |
+| L-02 | 前进进入 45 cm 通道 | 组 B（左右），左右约 45 mm，3 帧内 `NEAR_RETURN`，`TRACKING` | | ☐ |
+| L-03 | 左移/右移 | 组 A（前后）；运动左侧=后/前，横向修正落在 `vx` | | ☐ |
+| L-04 | 倒车 | 组 B 但左右墙映射对调，修正方向不反向 | | ☐ |
 | L-05 | 车体原地转 90° 后仍沿车头前进 | 组不因旋转而交换（仍 B） | | ☐ |
-| L-06 | 一侧墙结束（有效远墙 >150，连续 3 次） | 确认 Absent，切单墙/无墙，横向纠偏平滑回 0 | | ☐ |
-| L-07 | 拔掉/遮挡任一路；读取失败/未安装 | 该路 Unknown/不可用；不误判 Absent；超时进入 SENSOR_FAULT | | ☐ |
-| L-08 | 双墙/单墙低速直线 | 无持续振荡/过冲；P/I/D 遥测合理；先保持 Ki=0 | | ☐ |
-| L-09 | 通道口/墙结束持续返回 9999 | 不写 Absent；超过 noWallTimeout 后切 NO_WALL/单墙，能继续通过路口 | | ☐ |
-| L-10 | 单侧/双侧 <20 mm 过近 | 进入 TOO_CLOSE，向远离最近墙方向修正，不判故障/不停车；恢复到 >=20 mm 后回双/单墙 | | ☐ |
-| L-11 | 双墙走廊门控 | 两侧都<150 mm 时即使停车也保持双墙模式/PID；单侧>150 mm 时 corridor-inactive、不纠偏、不慢速 | | ☐ |
+| L-06 | 一侧墙结束（有效远墙 850 mm） | 该侧 `FAR_RETURN` 且 valid；不进入双墙，横向修正平滑回 0；原始距离仍为 850 | | ☐ |
+| L-07 | 拔掉/遮挡任一路 | 该路 `valid=false/UNKNOWN`；不误判 FAR；不虚构双墙 | | ☐ |
+| L-08 | 双墙低速直线 | 无持续振荡/过冲；P/D 遥测合理；先保持 Ki=0 | | ☐ |
+| L-09 | 通道口持续 9999 | 不写 FAR/无墙；180 ms 后 valid=false/UNKNOWN | | ☐ |
+| L-10 | 单侧/双侧 <20 mm 过近 | `TOO_CLOSE`，向远离最近墙方向修正；不判故障/不减速；恢复后回 TRACKING | | ☐ |
+| L-11 | 上电就在 100–150 mm | 连续 3 帧进入 `MID_RETURN`，可 `TRACKING`，不永久 UNKNOWN | | ☐ |
+| L-12 | 前/后 1.65 m / 0.98 m，左右 45 mm | Lane 保持 TRACKING；前后为 `FAR_RETURN` 且原始值不变 | | ☐ |
+| L-13 | 正前方 60 mm、基础速度 0.55 m/s | SafetySupervisor 降低 vx，LaneKeeper 不改变巡航速度 | | ☐ |
+| L-14 | 上电静止、无遥控、车偏左/偏右 10–20 mm | 无方向自动回退选对；`TRACKING/TOO_CLOSE`；`corr` 指向中心；车实际横移 | | ☐ |
+| L-15 | 停车居中时误差 5 mm / 40 mm | 5 mm 给最小 0.08 m/s；误差 <3 mm 不再给最小速度；有平移速度时恢复 PD | | ☐ |
 
-- 观察工具：`python3 test/distance_monitor.py` 的 `$D` 末尾车道字段
-  （mode/group/wallMask/left/right/err/PID/corr/输出）。
-- 首测务必低速（例如 `vx <= 0.15 m/s`），先让车在通道中心附近进入双墙，再人为偏移。
-- 标定后把统一墙距 PID `wallPid` 的 Kp/Kd 回填到 `lane_config.hpp`，并更新本表。
+- 观察工具：`python3 test/distance_monitor.py` 或 `test/lane_plot.py` 的 `$D`
+  车道字段（mode/group/near/valid/fresh/left/right/centerErr/P/D/corr/输出）。
+- 首测务必低速（例如 `vx <= 0.15 m/s`），先让车在通道中心附近进入 TRACKING，再人为偏移。
+- 标定后把横向 PD 的 Kp/Kd 回填到 `lane_config.hpp`，并更新本表。
 
 ---
 
@@ -201,11 +205,16 @@ pros make        # 期望：无 warning / 无 error，生成 bin/hot.package.bin
 | `sensors[0..3].xM/yM` | lane_config.hpp | 量测距出射点到车体中心（顶点半径约 0.1803 m） | 0.1803 占位，未验证 |
 | `sensors[0..3].axisRad` | lane_config.hpp | 量实际出射轴（前 +X、左 +Y、后 π、右 −Y） | 0 / π/2 / π / −π/2 占位，未验证 |
 | `sensors[0..3].rangeSource` | lane_config.hpp | 确认逻辑通道↔快照索引 | 0/2/1/3（前/左/后/右），未验证 |
-| `targetWallMm` | lane_config.hpp | 原始测距目标（45 cm 通道约 45 mm） | 45 占位 |
-| `wallPid` Kp/Kd | lane_config.hpp | L-08 低速整定，先 Ki=0 | 0.0015/0.0003 占位 |
-| `min/maxCorridorWidthM` | lane_config.hpp | 实际通道宽度/墙角容忍 | 0.30–0.60 m 占位 |
-| `motionStopMm/motionSlowMm` | lane_config.hpp | 前向安全距离 | 120/300 mm 占位 |
-| `enableLaneAssist` | robot_config.hpp | L-01..L-11 完成后打开；本次测试临时 true | true |
+| `channel.enterMm/exitMm/detectMm` | lane_config.hpp | 近壁分类/双墙门限 | 100/150/150 占位 |
+| `channel.maxAgeMs/freshWindowMs` | lane_config.hpp | 实测刷新率/丢帧 | 180/42 ms 占位 |
+| `pd.kp/kd` | lane_config.hpp | L-08 低速整定，先 Ki=0 | 0.0010/0.000025 占位 |
+| `state.min/maxCorridorWidthM` | lane_config.hpp | 实际通道宽度/墙角容忍 | 0.37–0.70 m 占位 |
+| `state.repulseMps` | lane_config.hpp | 过近排斥强度 | 0.10 m/s 占位 |
+| `state.standstillMinCorrectionMps` | lane_config.hpp | L-15 停车静摩擦补偿 | 0.08 m/s 占位 |
+| `state.standstillDeadbandMm` | lane_config.hpp | L-15 居中死区 | 3 mm 占位 |
+| `state.maxCorrectionMps/maxLateralAccelMps2` | lane_config.hpp | 横向限幅/变化率 | 0.14 m/s / 0.70 m/s² 占位 |
+| `SafetyConfig` | safety_config.hpp | 实测制动距离/延迟 | 0.12 s / 1.2 m/s² / 22 mm 占位 |
+| `enableLaneAssist/enableSafety` | robot_config.hpp | L-01..L-13 完成后决定；本次测试临时 true | true/true |
 
 ---
 

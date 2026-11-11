@@ -134,14 +134,15 @@ err < 0（顺时针）：-0.221 rad/s（-12.66°/s）
 ```
 $D,ms,instMask,validMask,
    dF,cF,sF,vF,tF,  dR,cR,sR,vR,tR,  dL,cL,sL,vL,tL,  dRt,cRt,sRt,vRt,tRt,
-   laneMode,laneGroup,wallMask,usableMask,
-   leftMm,rightMm,errMm,pMms,iMms,dMms,corrMms,outVxMms,outVyMms,outOmegaMradS,
-   filterS0..S3,filterValidMask,targetWallMm,corridorWidthMm,laneReason,
-   speedScaleMilli,forwardScaleMilli,motionObstacleMm,laneFlags,
-   sideLeftRawMm,sideRightRawMm,pidTargetMmS,tooCloseMask
+   laneMode,laneGroup,nearMask,validMask,
+   leftMm,rightMm,centerErrMm,pMms,iMms,dMms,corrMms,outVxMms,outVyMms,outOmegaMradS,
+   filterS0..S3,freshMask,leftClass,corridorWidthMm,laneReason,
+   qualityMilli,rightClass,pairScoreMilli,laneFlags,
+   sideLeftRawMm,sideRightRawMm,pidTargetMmS,tooCloseMask,
+   safetyScaleMilli,safetyNearestMm,safetyFlags
 ```
 
-方向顺序：前、后、左、右。末尾 **30 个**是车道保持字段（旧固件没有，脚本会自动兼容）。
+方向顺序：前、后、左、右。末尾 **30 个**是车道保持字段，随后 **3 个**是安全层字段（旧固件没有，脚本会自动兼容）。
 
 - `d`：距离 `mm`；`-1` = 读取失败，`9999` = 无目标
 - `c`：置信度 `0..63`；`-1` = 读取失败
@@ -154,27 +155,35 @@ $D,ms,instMask,validMask,
 
 车道字段：
 
-- `laneMode`：0=关 1=识别 2=双墙 3=左墙 4=右墙 5=无墙 6=转弯 7=传感器故障 8=过近（主动远离）
+- `laneMode`：0=关 1=NO_PAIR 2=INSUFFICIENT_DATA 3=NO_CORRIDOR
+  4=TRACKING 5=DEGRADED 6=TOO_CLOSE
 - `laneGroup`：-1=未选，0=Group A(前后)，1=Group B(左右)
-- `wallMask` / `usableMask` / `filterValidMask`：逻辑 S0..S3，bit0=S0
-- `leftMm/rightMm`：运动左/右传感器的滤波距离（PID 控制量）；-1=不可用
-- `errMm`：墙距 PID 误差，**向右为正**
-- `pMms/iMms/dMms/corrMms`：PID 各项与最终纠偏 [mm/s]
+- `nearMask/validMask/freshMask`：逻辑 S0..S3，bit0=S0；
+  分别表示 `NEAR_RETURN`、最近有效回波仍在 maxAge 内、处于新鲜窗口
+- `leftMm/rightMm`：当前通道对运动左/右传感器的滤波距离；-1=不可用
+- `centerErrMm`：`(右墙距-左墙距)/2`，**向右为正**
+- `pMms/iMms/dMms/corrMms`：横向 PD 各项与最终纠偏 [mm/s]；v2.1 默认 Ki=0
 - `filterS0..S3`：四路滤波距离，顺序为逻辑 S0..S3 = **前/左/后/右**
-  （注意与前 20 个原始字段的“前/后/左/右”顺序不同）；`targetWallMm=45` 是单墙原始距离目标
-- `corridorWidthMm`：双墙参考垂距之和；`laneReason`：状态机原因码
-- `speedScaleMilli/forwardScaleMilli`：状态限速/前向安全比例 ×1000
-- `motionObstacleMm`：运动方向最近障碍；`laneFlags`：active/turning/degraded/
-  fault/stateChanged/groupChanged/headingValid/headingStable/corridorWidthValid/corridorActive
+  （注意与前 20 个原始字段的“前/后/左/右”顺序不同）
+- `leftClass/rightClass`：0=UNKNOWN 1=NEAR_RETURN 2=MID_RETURN 3=FAR_RETURN；
+  `FAR_RETURN` 是**有效远距回波**，不是“无墙”
+- `corridorWidthMm`：两侧滤波距离 + 传感器几何宽度；`laneReason`：模式原因码
+- `qualityMilli`：1.0=TRACKING，0.5=DEGRADED/TOO_CLOSE
+- `pairScoreMilli`：`max(|通道法向·传感器轴|)`
+- `laneFlags`：bit0 active、bit1 degraded、bit2 tooClose、bit3 pairValid、
+  bit4 modeChanged、bit5 groupChanged、bit6 headingValid、bit7 corridorWidthValid、
+  bit8 corridor、bit9 decay、bit10 fallbackPair
 - `sideLeftRawMm/sideRightRawMm`：物理左/右（逻辑 S1/S3）的原始距离，过近时仍有值
-- `pidTargetMmS`：限幅后、速度比例前的控制目标；TOO_CLOSE 时是过近排斥量
+- `pidTargetMmS`：限幅后、平滑前的控制目标；TOO_CLOSE 时是过近排斥量
 - `tooCloseMask`：bit0=左过近，bit1=右过近
 - `outVxMms/outVyMms/outOmegaMradS`：LaneKeeper 输出命令；omega 为透传值，
   最终航向修正后的 omega 看 `$P` 的 `tw`
+- 末尾 3 个安全层字段：`safetyScaleMilli`、`safetyNearestMm`、`safetyFlags`
+  （bit0 enabled、bit1 configValid、bit2 limited、bit3 stopped、bit4 headingBlocked）
 
-默认 `corridorOnly=true`：只有物理左/右原始距离都 `<150 mm` 才进入墙距控制；
-门外 reason=`corridor-inactive`，不纠偏。门内即使停车也保持双墙模式/PID，
-并以 ≤80 mm/s 自动居中/远离过近侧（`standstillCenter=true`）。
+v2.1 的 LaneKeeper **只输出横向 delta**，不改变巡航速度；前向 ToF 限速由
+`SafetySupervisor` 在合成命令之后统一执行。默认 `enableLaneAssist=true`
+是本次实车测试的临时状态，安装几何/PID 未标定时不要长期打开。
 
 车道保持说明见 `docs/lane_keeping.md`。
 
@@ -245,13 +254,14 @@ front_mm,front_conf,front_size,front_vel_mm_s,front_type,
 rear_mm,rear_conf,rear_size,rear_vel_mm_s,rear_type,
 left_mm,left_conf,left_size,left_vel_mm_s,left_type,
 right_mm,right_conf,right_size,right_vel_mm_s,right_type,
-lane_mode,lane_group,wall_mask,usable_mask,
-left_mm,right_mm,lane_err_mm,
+lane_mode,lane_group,near_mask,valid_mask,
+left_mm,right_mm,center_err_mm,
 lane_p_mm_s,lane_i_mm_s,lane_d_mm_s,lane_corr_mm_s,
 out_vx_mm_s,out_vy_mm_s,out_omega_mrad_s,
-filter_s0_mm,filter_s1_mm,filter_s2_mm,filter_s3_mm,filter_valid_mask,
-target_wall_mm,corridor_width_mm,lane_reason,
-speed_scale_milli,forward_scale_milli,motion_obstacle_mm,lane_flags
+filter_s0_mm,filter_s1_mm,filter_s2_mm,filter_s3_mm,fresh_mask,
+left_class,corridor_width_mm,lane_reason,
+quality_milli,right_class,pair_score_milli,lane_flags,
+safety_scale_milli,safety_nearest_mm,safety_flags
 ```
 
 ### 快速验收
@@ -272,9 +282,10 @@ speed_scale_milli,forward_scale_milli,motion_obstacle_mm,lane_flags
 - 物理左/右原始距离（过近时仍有值）；
 - 当前运动组控制侧的滤波距离；
 - 墙距/过近误差；
-- 墙距 PID 的 P/I/D、控制目标、实际横向修正；
-- `TOO_CLOSE` 时自动提示“正在主动远离”，此时墙距 PID 被旁路，P/I/D 为 0，
-  输出的是过近排斥量。
+- 横向 PD 的 P/D、控制目标、实际横向修正；
+- `TOO_CLOSE` 时自动提示“正在主动远离”，此时 PD 被旁路，
+  输出的是过近排斥量；LaneKeeper 不改变巡航速度；
+- 同时显示安全层 `scale` 和最近障碍，便于区分“车道纠偏”和“安全减速”。
 
 ```bash
 python3 test/lane_plot.py                      # 自动找串口

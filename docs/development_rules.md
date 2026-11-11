@@ -240,6 +240,8 @@ bash scripts/test_native.sh   # 主机单测 + 遥测字段契约
 - `src/chassis/kinematics.cpp`、`src/chassis/heading_controller.cpp`、`src/radio/input_mapping.cpp`；
 - `src/lane/*.cpp`、`src/modules/lane_keeper.cpp`、`include/lane/*.hpp`、
   `include/modules/lane_keeper.hpp`；
+- `src/safety/*.cpp`、`src/modules/safety_supervisor.cpp`、`include/safety/*.hpp`、
+  `include/modules/safety_supervisor.hpp`；
 - `include/core/*`、`include/chassis/chassis_config.hpp`、`include/chassis/kinematics.hpp`、
   `include/chassis/heading_controller.hpp`、`include/imu/imu_config.hpp`、
   `include/distance/distance_config.hpp`、`include/distance/range_status.hpp`、

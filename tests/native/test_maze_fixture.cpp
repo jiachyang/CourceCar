@@ -121,16 +121,13 @@ int main() {
 
     lane::LaneConfig cfg = lane::makeDefaultLaneConfig();
     cfg.layoutVerified = true;
-    cfg.state.acquireTimeMs = 1;
-    cfg.state.acquireSpeedScale = 1.0;
-    cfg.state.maxSpeedScaleRatePerSec = 1000.0;
+    cfg.channel.lowPassAlpha = 1.0;
     cfg.state.maxLateralAccelMps2 = 1000.0;
-    cfg.state.motionStopMm = 0.0;
-    cfg.state.motionSlowMm = 1.0;
-    cfg.state.maxLateralCorrectionMps = 0.5;
-    cfg.wallPid.kp = 0.01;
-    cfg.wallPid.outputLimit = 1.0;
-    cfg.filter.lowPassAlpha = 1.0;
+    cfg.state.maxCorrectionMps = 0.5;
+    cfg.pd.kp = 0.01;
+    cfg.pd.outputLimit = 1.0;
+    cfg.pd.pLimit = 1.0;
+    cfg.pd.dLimit = 1.0;
 
     const auto firstSnap = maze_world::sensorSnapshot(
         walls, cx, cy, 0.0, -1.0, cfg, 20);  // 车体 +X 朝北
@@ -147,7 +144,7 @@ int main() {
 
     std::uint32_t nowMs = 20;
     lane::LaneKeeperState st{};
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const auto snap = maze_world::sensorSnapshot(
             walls, cx, cy, 0.0, -1.0, cfg, nowMs);
         keeper.update(core::MotionCommand{0.30, 0.0, 0.0}, snap,
@@ -157,15 +154,15 @@ int main() {
     }
     assert(st.configValid);
     assert(st.group == lane::kGroupB);  // 前进用左右组
-    assert(st.state == lane::LaneState::kDualWall);
-    assert(st.leftObserved && st.rightObserved);
-    assert(approx(st.leftDistanceMm, 45.0, 1.0));
-    assert(approx(st.rightDistanceMm, 45.0, 1.0));
-    assert(approx(st.corridorWidthM,
-                  2.0 * lane::kDefaultSensorRadiusM + 0.090, 0.001));
-    assert(approx(st.lateralErrorMm, 0.0, 0.5));
+    assert(st.mode == lane::LaneMode::kTracking);
+    assert(st.leftValid && st.rightValid);
+    assert(std::abs(st.leftMm - 45.0) <= 1.0);
+    assert(std::abs(st.rightMm - 45.0) <= 1.0);
+    assert(std::abs(st.corridorWidthM -
+                    (2.0 * lane::kDefaultSensorRadiusM + 0.090)) <= 0.001);
+    assert(std::abs(st.centerErrorMm) <= 0.5);
 
-    // --- 传感器轴略偏离法向：参考垂距仍应还原约 0.225 m ---
+    // --- 传感器轴略偏离法向：近壁距离仍可跟踪，宽/误差不爆炸 ---
     {
         lane::LaneConfig tilted = cfg;
         tilted.sensors[lane::kS1].axisRad = lane::kPi / 2.0 + 0.15;
@@ -176,7 +173,7 @@ int main() {
         k2.enable = true;
         lane::LaneKeeperState s2{};
         std::uint32_t t2 = 20;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 5; ++i) {
             const auto snap = maze_world::sensorSnapshot(
                 walls, cx, cy, 0.0, -1.0, tilted, t2);
             k2.update(core::MotionCommand{0.30, 0.0, 0.0}, snap,
@@ -184,14 +181,13 @@ int main() {
             s2 = k2.getState();
             t2 += 20;
         }
-        assert(s2.state == lane::LaneState::kDualWall);
-        assert(std::fabs(s2.leftReferenceM - 0.225) <= 0.002);
-        assert(std::fabs(s2.rightReferenceM - 0.225) <= 0.002);
+        assert(s2.mode == lane::LaneMode::kTracking);
+        assert(std::fabs(s2.corridorWidthM - 0.4506) <= 0.003);
     }
 
     // 车体向西偏 10 mm：左约 35 mm、右约 55 mm；右墙更远 -> 向右修正
     const double offsetCx = cx - 0.01;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 4; ++i) {
         nowMs += 20;
         const auto fresh = maze_world::sensorSnapshot(
             walls, offsetCx, cy, 0.0, -1.0, cfg, nowMs);
@@ -199,11 +195,11 @@ int main() {
                       core::HeadingState{}, 0.02);
         st = keeper.getState();
     }
-    assert(st.state == lane::LaneState::kDualWall);
-    assert(st.lateralErrorMm > 0.0);       // 右墙更远 -> 向右
+    assert(st.mode == lane::LaneMode::kTracking);
+    assert(st.centerErrorMm > 0.0);       // 右墙更远 -> 向右
     assert(st.lateralCorrectionMps > 0.0);
     assert(st.command.vy < 0.0);           // 车体 +Y 左，负为右
-    assert(approx(st.command.vx, 0.30, 0.01));
+    assert(std::abs(st.command.vx - 0.30) <= 0.01);
 
     std::printf("maze fixture tests: ALL PASS\n");
     return 0;

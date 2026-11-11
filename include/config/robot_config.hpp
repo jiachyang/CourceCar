@@ -28,6 +28,7 @@ struct VehicleConfig {
     bool enableImuHeading   = true;   ///< IMU 航向保持：开启（Kp 初值 1.0，待整定）
     bool enableSlewLimit    = true;   ///< 加减速限制（DRV-006）
     bool enableRadioControl = true;   ///< 遥控输入模块（opcontrol 中生效）
+    bool enableSafety       = true;   ///< 前向 ToF 安全限速（唯一安全出口）
 
     /// 车道保持（LaneKeeper）：**本次实车测试临时打开**。
     /// 传感器安装位置/轴向/PID 仍未标定（LaneConfig::layoutVerified=false）；

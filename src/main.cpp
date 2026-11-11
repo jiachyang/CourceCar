@@ -11,9 +11,9 @@
  *   - bringup          —— 台架调试（静摩擦标定、点动自检），不进入正常控制。
  *
  * 数据流：
- *   Radio ──► core::MotionCommand ──► LaneKeeper(vx/vy 纠偏) ──► Chassis ──► 四轮电机
+ *   Radio ──► core::MotionCommand ──► LaneKeeper(横向 delta) ──► Safety ──► Chassis
  *   IMU   ──► core::HeadingState  ──► Chassis（航向 PID，ω 修正仍由 Chassis 完成）
- *   DistanceArray ──► core::RangeSnapshot ──► LaneKeeper（墙体状态/双墙/单墙 PID）
+ *   DistanceArray ──► core::RangeSnapshot ──► LaneKeeper / SafetySupervisor
  *   *State ──► diag::Telemetry    ──► 串口遥测
  */
 #include "main.h"
@@ -29,6 +29,7 @@
 #include "modules/imu.hpp"
 #include "modules/lane_keeper.hpp"
 #include "modules/radio.hpp"
+#include "modules/safety_supervisor.hpp"
 #include "pros/rtos.hpp"
 
 namespace {
@@ -42,6 +43,7 @@ imu::Imu g_imu;
 radio::Radio g_radio;
 distance::DistanceArray g_distance;
 lane::LaneKeeper g_lane;
+safety::SafetySupervisor g_safety;
 
 // 遥测输出器：只读上面各模块的状态快照。
 diag::Telemetry g_telemetry;
@@ -52,6 +54,7 @@ void syncVehicleConfig() {
     g_chassis.enableHeadingHold = g_vehicle.enableImuHeading;
     g_chassis.enableSlewLimit   = g_vehicle.enableSlewLimit;
     g_lane.enable               = g_vehicle.enableLaneAssist;
+    g_safety.enable             = g_vehicle.enableSafety;
 }
 
 /// 一个控制周期的调度：传感器 → 遥控 → 数据传递 → 底盘执行。
@@ -60,12 +63,12 @@ void runControlCycle(double dt) {
     if (g_vehicle.enableImu) {
         g_imu.update();
     }
-    g_distance.update();  // 四路测距：供 LaneKeeper 与遥测使用
+    g_distance.update();  // 四路测距：供 LaneKeeper / 安全层 / 遥测使用
 
     // 2) 采集遥控输入（失联/超时时 state.valid=false）
     g_radio.update();
 
-    // 3) 数据传递：航向状态 → 底盘；遥控基础命令 → LaneKeeper → 底盘
+    // 3) 数据传递：航向状态 → 底盘；遥控命令 → LaneKeeper → 安全层 → 底盘
     //    底盘只认 core::HeadingState，不知道航向来自 IMU 还是别的源。
     g_chassis.setHeadingState(g_imu.toHeadingState());
 
@@ -75,10 +78,12 @@ void runControlCycle(double dt) {
         base = g_radio.getDriveCommand();
     }
 
-    // 车道保持只修改 vx/vy；omega 原样透传，航向 PID 仍在 Chassis 内。
-    g_lane.update(base, g_distance.toRangeSnapshot(),
-                  g_imu.toHeadingState(), dt);
-    g_chassis.setCommand(g_lane.getState().command);
+    // 车道保持只叠加横向 delta；前向安全由独立安全层统一限速。
+    const core::RangeSnapshot ranges = g_distance.toRangeSnapshot();
+    g_lane.update(base, ranges, g_imu.toHeadingState(), dt);
+    g_safety.update(g_lane.getState().command, ranges,
+                    g_imu.toHeadingState());
+    g_chassis.setCommand(g_safety.getState().command);
 
     // 4) 底盘执行（航向修正 + IK + 电机下发全在模块内部）
     g_chassis.update(dt);
@@ -95,6 +100,7 @@ void initialize() {
     g_radio.init(radio::makeDefaultRadioConfig());
     g_distance.init(distance::makeDefaultDistanceConfig());
     g_lane.init(lane::makeDefaultLaneConfig());
+    g_safety.init(safety::makeDefaultSafetyConfig());
 
     if (g_vehicle.enableImu) {
         g_imu.startCalibration();
@@ -108,13 +114,15 @@ void initialize() {
     sources.radio    = &g_radio.getState();
     sources.distance = &g_distance.getState();
     sources.lane     = &g_lane.getState();
+    sources.safety   = &g_safety.getState();
     g_telemetry.init(diag::makeDefaultTelemetryConfig(), sources);
 }
 
 void disabled() {
     // 禁用期间必须确保底盘停止，不得保留上一帧动作。
     g_chassis.stop();
-    g_lane.reset();  // 清车道 PID/组/墙体确认历史，避免重新使能时复用旧状态
+    g_lane.reset();    // 清车道 PD/选对/近壁分类历史
+    g_safety.reset();  // 清安全限速状态
 }
 
 void competition_initialize() {}

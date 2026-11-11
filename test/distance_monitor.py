@@ -6,11 +6,12 @@ V5 四路距离传感器实时监视器。
 固件通过 User 口以 20 Hz 输出：
   $D,ms,instMask,validMask,
      dF,cF,sF,vF,tF,  dR,cR,sR,vR,tR,  dL,cL,sL,vL,tL,  dRt,cRt,sRt,vRt,tRt,
-     laneMode,laneGroup,wallMask,usableMask,
-     leftMm,rightMm,errMm,pMms,iMms,dMms,corrMms,outVxMms,outVyMms,outOmegaMradS,
-     filterS0..S3,filterValidMask,targetWallMm,corridorWidthMm,laneReason,
-     speedScaleMilli,forwardScaleMilli,motionObstacleMm,laneFlags,
-     sideLeftRawMm,sideRightRawMm,pidTargetMmS,tooCloseMask
+     laneMode,laneGroup,nearMask,validMask,
+     leftMm,rightMm,centerErrMm,pMms,iMms,dMms,corrMms,outVxMms,outVyMms,outOmegaMradS,
+     filterS0..S3,freshMask,leftClass,corridorWidthMm,laneReason,
+     qualityMilli,rightClass,pairScoreMilli,laneFlags,
+     sideLeftRawMm,sideRightRawMm,pidTargetMmS,tooCloseMask,
+     safetyScaleMilli,safetyNearestMm,safetyFlags
 
 方向顺序：前(7)、后(8)、左(9)、右(10)。
   d = 距离 [mm]（-1=读取失败，9999=无目标）
@@ -20,21 +21,28 @@ V5 四路距离传感器实时监视器。
   t = VEXos 识别的设备类型（7=Distance，0=无设备，2=Motor，6=IMU…）
   instMask/validMask：bit0=前、bit1=后、bit2=左、bit3=右
 
-车道字段（旧固件可能没有，解析器会自动兼容）：
-  laneMode：0=关 1=识别 2=双墙 3=左墙 4=右墙 5=无墙 6=转弯 7=传感器故障 8=过近
+车道字段（v2.1；旧固件可能没有，解析器会自动兼容）：
+  laneMode：0=关 1=NO_PAIR 2=INSUFFICIENT_DATA 3=NO_CORRIDOR
+            4=TRACKING 5=DEGRADED 6=TOO_CLOSE
   laneGroup：-1=未选 0=Group A(前后) 1=Group B(左右)
-  wallMask/usableMask/filtValidMask：逻辑 S0..S3，bit0=S0
-  leftMm/rightMm：运动左/右传感器的滤波距离 [mm]，-1=不可用
-  errMm：墙距 PID 误差，向右为正
-  pMms/iMms/dMms/corrMms：PID 各项与最终纠偏 [mm/s]
-  filterS0..S3：四路滤波距离，逻辑 S0..S3 = 前/左/后/右；targetWallMm：单墙目标
-  corridorWidthMm：双墙参考垂距之和；laneReason：状态机原因码
-  speedScaleMilli/forwardScaleMilli：状态限速/前向安全比例 ×1000
-  motionObstacleMm：运动方向最近障碍；laneFlags：active/turning/degraded/fault 等
+  nearMask/validMask/freshMask：逻辑 S0..S3，bit0=S0
+  leftMm/rightMm：运动左/右传感器滤波距离 [mm]，-1=不可用
+  centerErrMm：(右墙距-左墙距)/2，向右为正
+  pMms/iMms/dMms/corrMms：横向 PD 各项与最终纠偏 [mm/s]
+  filterS0..S3：四路滤波距离，逻辑 S0..S3 = 前/左/后/右
+  leftClass/rightClass：0=UNKNOWN 1=NEAR_RETURN 2=MID_RETURN 3=FAR_RETURN
+  corridorWidthMm：两侧滤波距离 + 传感器几何宽度；laneReason：模式原因码
+  qualityMilli：1.0=TRACKING，0.5=DEGRADED/TOO_CLOSE
+  pairScoreMilli：max(|通道法向·传感器轴|)
+  laneFlags：bit0 active、bit1 degraded、bit2 tooClose、bit3 pairValid、
+             bit4 modeChanged、bit5 groupChanged、bit6 headingValid、
+             bit7 corridorWidthValid、bit8 corridor、bit9 decay、bit10 fallbackPair
   sideLeftRawMm/sideRightRawMm：物理左/右原始距离；pidTargetMmS：控制目标横向速度
   tooCloseMask：bit0=左过近，bit1=右过近
   outVxMms/outVyMms/outOmegaMradS：LaneKeeper 输出命令（omega 为透传值；
   最终航向修正后的 omega 看 $P 的 tw）
+  safetyScaleMilli/safetyNearestMm/safetyFlags：安全层限速比例/最近障碍/flags
+  （bit0 enabled、bit1 configValid、bit2 limited、bit3 stopped、bit4 headingBlocked）
 
 用法：
   python3 test/distance_monitor.py                 # 自动找 /dev/ttyACM*
@@ -65,49 +73,49 @@ NO_TARGET_MM = 9999
 
 # $D 末尾追加的车道保持字段（顺序与 src/diag/telemetry.cpp 一致）
 LANE_FIELDS = [
-    "lane_mode", "lane_group", "wall_mask", "usable_mask",
-    "left_mm", "right_mm", "lane_err_mm",
+    "lane_mode", "lane_group", "near_mask", "valid_mask",
+    "left_mm", "right_mm", "center_err_mm",
     "lane_p_mm_s", "lane_i_mm_s", "lane_d_mm_s", "lane_corr_mm_s",
     "out_vx_mm_s", "out_vy_mm_s", "out_omega_mrad_s",
     "filter_s0_mm", "filter_s1_mm", "filter_s2_mm", "filter_s3_mm",
-    "filter_valid_mask", "target_wall_mm", "corridor_width_mm",
-    "lane_reason", "speed_scale_milli", "forward_scale_milli",
-    "motion_obstacle_mm", "lane_flags",
+    "fresh_mask", "left_class", "corridor_width_mm",
+    "lane_reason", "quality_milli", "right_class",
+    "pair_score_milli", "lane_flags",
     "side_left_raw_mm", "side_right_raw_mm", "pid_target_mm_s",
     "too_close_mask",
 ]
 LANE_MODE_NAMES = {
     0: "关",
-    1: "识别",
-    2: "双墙",
-    3: "左墙",
-    4: "右墙",
-    5: "无墙",
-    6: "转弯",
-    7: "传感器故障",
-    8: "过近",
+    1: "无通道方向",
+    2: "数据不足",
+    3: "非走廊",
+    4: "跟踪",
+    5: "降级",
+    6: "过近",
 }
 LANE_REASON_NAMES = {
     0: "none",
     1: "disabled",
     2: "config",
     3: "input",
-    4: "startup",
-    5: "stopped",
-    6: "no-group",
-    7: "group-changed",
-    8: "after-turn",
-    9: "wall-acquiring",
-    10: "corridor-inconsistent",
-    11: "sensor-timeout",
-    12: "dual",
-    13: "left-only",
-    14: "right-only",
-    15: "no-walls",
-    16: "turning",
-    17: "too-close",
-    18: "corridor-inactive",
+    4: "no-pair",
+    5: "insufficient-data",
+    6: "no-corridor",
+    7: "tracking",
+    8: "too-close",
+    9: "stale-measurement",
+    10: "lost-wall-hold",
 }
+LANE_CLASS_NAMES = {
+    -1: "—",
+    0: "U",
+    1: "近",
+    2: "中",
+    3: "远",
+}
+SAFETY_FIELDS = [
+    "safety_scale_milli", "safety_nearest_mm", "safety_flags",
+]
 
 # ANSI
 CLR = "\x1b[2J\x1b[H"
@@ -232,6 +240,7 @@ def parse(line):
         "valid_mask": nums[2],
         "readings": [],
         "lane": None,
+        "safety": None,
     }
     k = 3
     for side, port, csv_name in SIDES:
@@ -254,6 +263,11 @@ def parse(line):
         frame["lane"] = dict(
             zip(LANE_FIELDS, nums[base_fields: base_fields + len(LANE_FIELDS)])
         )
+        start = base_fields + len(LANE_FIELDS)
+        if len(nums) >= start + len(SAFETY_FIELDS):
+            frame["safety"] = dict(
+                zip(SAFETY_FIELDS, nums[start:start + len(SAFETY_FIELDS)])
+            )
     return frame
 
 
@@ -416,36 +430,35 @@ def render(frame, port, frames, age_ms, csv_path, ansi=True, diag=None, scan=Non
             mode_name = LANE_MODE_NAMES.get(mode, str(mode))
             reason_name = LANE_REASON_NAMES.get(reason, str(reason))
             group = { -1: "—", 0: "A", 1: "B" }.get(lane["lane_group"], "?")
-            wall = lane["wall_mask"] & 0xF
-            usable = lane["usable_mask"] & 0xF
-            filt = lane.get("filter_valid_mask", -1)
+            near = lane.get("near_mask", 0) & 0xF
+            valid = lane.get("valid_mask", 0) & 0xF
+            fresh = lane.get("fresh_mask", -1)
             left = "—" if lane["left_mm"] < 0 else f"{lane['left_mm']} mm"
             right = "—" if lane["right_mm"] < 0 else f"{lane['right_mm']} mm"
             width = lane.get("corridor_width_mm", -1)
             width_txt = "—" if width < 0 else f"{width} mm"
-            if mode in (2, 3, 4):
+            if mode == 4:
                 color = GREEN
-            elif mode in (1, 6, 8):
+            elif mode in (5, 6):
                 color = YELLOW
-            elif mode == 7:
-                color = RED
             else:
                 color = DIM
             lines.append(c(
                 color,
                 f"车道：{mode_name}({reason_name})  组={group}  "
-                f"墙=0b{wall:04b} 可用=0b{usable:04b} "
-                f"滤波=0b{filt & 0xF:04b}"
+                f"近壁=0b{near:04b} 有效=0b{valid:04b} "
+                f"新鲜=0b{fresh & 0xF:04b}"
             ))
             side_l = lane.get("side_left_raw_mm", -1)
             side_r = lane.get("side_right_raw_mm", -1)
             too_close = lane.get("too_close_mask", 0)
             pid_target = lane.get("pid_target_mm_s", 0)
+            lcls = LANE_CLASS_NAMES.get(lane.get("left_class", -1), "?")
+            rcls = LANE_CLASS_NAMES.get(lane.get("right_class", -1), "?")
             lines.append(c(
                 DIM,
-                f"      控制左={left} 右={right} 宽={width_txt} "
-                f"目标={lane.get('target_wall_mm', -1)} mm  "
-                f"误差={lane['lane_err_mm']} mm"
+                f"      控制左={left}({lcls}) 右={right}({rcls}) 宽={width_txt} "
+                f"误差={lane.get('center_err_mm', 0)} mm"
             ))
             lines.append(c(
                 DIM,
@@ -454,17 +467,24 @@ def render(frame, port, frames, age_ms, csv_path, ansi=True, diag=None, scan=Non
             ))
             lines.append(c(
                 DIM,
-                f"      P/I/D={lane['lane_p_mm_s']}/{lane['lane_i_mm_s']}/"
-                f"{lane['lane_d_mm_s']} mm/s  "
-                f"PID目标={pid_target} mm/s 修正={lane['lane_corr_mm_s']} mm/s"
+                f"      P/D={lane['lane_p_mm_s']}/{lane['lane_d_mm_s']} mm/s  "
+                f"目标={pid_target} mm/s 修正={lane['lane_corr_mm_s']} mm/s  "
+                f"质量={lane.get('quality_milli', 0) / 1000.0:.2f}"
             ))
             lines.append(c(
                 DIM,
-                f"      速度比例={lane.get('speed_scale_milli', -1) / 1000.0:.2f} "
-                f"前向安全={lane.get('forward_scale_milli', -1) / 1000.0:.2f} "
-                f"障碍={lane.get('motion_obstacle_mm', -1)} mm "
+                f"      对分={lane.get('pair_score_milli', 0) / 1000.0:.2f} "
                 f"flags=0x{lane.get('lane_flags', 0):X}"
             ))
+            safety = frame.get("safety")
+            if safety:
+                sflags = safety.get("safety_flags", 0)
+                lines.append(c(
+                    DIM,
+                    f"      安全层 scale={safety.get('safety_scale_milli', -1) / 1000.0:.2f} "
+                    f"最近障碍={safety.get('safety_nearest_mm', -1)} mm "
+                    f"flags=0x{sflags:X}"
+                ))
             lines.append(c(
                 DIM,
                 f"      输出 vx={lane['out_vx_mm_s']} vy={lane['out_vy_mm_s']} "
@@ -495,7 +515,7 @@ def headless_line(frame, age_ms):
         text += (f"  lane={mode_name}/g{lane['lane_group']}"
                  f"/L{lane.get('side_left_raw_mm', -1)}"
                  f"/R{lane.get('side_right_raw_mm', -1)}"
-                 f"/err{lane['lane_err_mm']}"
+                 f"/err{lane.get('center_err_mm', 0)}"
                  f"/out{lane.get('pid_target_mm_s', 0)}"
                  f"/corr{lane['lane_corr_mm_s']}")
     return text
@@ -582,7 +602,7 @@ def main():
             header += [f"{csv_name}_mm", f"{csv_name}_conf",
                        f"{csv_name}_size", f"{csv_name}_vel_mm_s",
                        f"{csv_name}_type"]
-        header += LANE_FIELDS
+        header += LANE_FIELDS + SAFETY_FIELDS
         csv_f.write(",".join(header) + "\n")
 
     frames = 0
@@ -620,6 +640,9 @@ def main():
                                 r["velocity"], r["plugged_type"]]
                     lane = f.get("lane")
                     row += [lane[name] if lane else -1 for name in LANE_FIELDS]
+                    safety = f.get("safety")
+                    row += [safety[name] if safety else -1
+                            for name in SAFETY_FIELDS]
                     csv_f.write(",".join(str(x) for x in row) + "\n")
                     if frames % 20 == 0:  # 约 1 s 刷一次盘
                         csv_f.flush()

@@ -1,20 +1,19 @@
 /**
  * @file modules/lane_keeper.hpp
- * @brief LaneKeeper 模块：四路近墙测距 + 组选择 + 双墙/单墙 PID + 状态机。
+ * @brief LaneKeeper v2.1：四路 ToF 近壁通道 + 稳定方向选对 + 横向 PD。
  *
- * 定位：**局部运动纠偏**，不替代全局路径规划，也不直接控制电机。
- * 输出是一个 `core::MotionCommand`（基础速度按状态限速 + 横向纠偏，
- * omega 原样透传），交给 Chassis 的既有链路：
+ * 职责边界（对齐 LaneKeeping_V2_1_RangeAware）：
+ *   - 只输出**横向修正** `(dvx,dvy)`，叠加到上游基础命令；
+ *   - **不修改**巡航速度，不输出 `speedScale`，不做前向安全急停；
+ *     唯一安全限速出口见 `modules/safety_supervisor.hpp`；
+ *   - `omega` 原样透传，航向 PID 仍在 Chassis 内；
+ *   - 原始 `RangeSnapshot` 只读，LaneKeeper 的近壁分类仅供诊断，
+ *     定位/地图必须直接读取原始测量，不能读 `NearClass`。
  *
- *   基础命令(车体) --> LaneKeeper --(vx,vy,omega)--> Chassis
- *                                                      ├ IMU 航向 PID（既有 HeadingController）
- *                                                      └ X-Drive IK -> 四电机
+ * 数据流：
  *
- * 因此 **IMU 航向 PID 没有在本模块重写**；LaneKeeper 只改 vx/vy。
- *
- * 输入是车体坐标 `core::MotionCommand` + `core::RangeSnapshot` +
- * `core::HeadingState`。若上游给世界坐标方向，先用
- * `lane::worldVelocityToBody()` 转换。
+ *   基础命令(车体) ──► LaneKeeper ──► command = base + laneDelta ──► Safety ──► Chassis
+ *   RangeSnapshot ────┘
  */
 #pragma once
 
@@ -25,80 +24,75 @@
 #include "lane/lane_config.hpp"
 #include "lane/lane_state_machine.hpp"
 #include "lane/pid.hpp"
-#include "lane/range_filter.hpp"
+#include "lane/range_channel.hpp"
 #include "lane/sensor_group_selector.hpp"
-#include "lane/wall_state.hpp"
 
 namespace lane {
 
-/// 单路墙体/滤波诊断快照。
-struct WallDebug {
-    WallStatus status = WallStatus::kUnknown;
-    std::int32_t rawMm = -1;        ///< 最近原始有效距离 [mm]
-    double filteredMm = 0.0;        ///< 滤波后距离 [mm]；无历史时无意义
-    bool rawValid = false;          ///< 原始距离是否在 hold 窗口内
-    bool filterValid = false;       ///< 滤波距离是否在 hold 窗口内
-    bool usable = false;            ///< Present && filterValid，可用于 PID
-    std::uint32_t rawMs = 0;        ///< 最近原始样本时刻
-    std::uint32_t filteredMs = 0;   ///< 最近滤波有效时刻
+/// 单路近壁/滤波诊断快照。
+struct ChannelDebug {
+    NearClass state = NearClass::kUnknown;
+    std::int32_t rawMm = -1;      ///< 最近原始有效距离 [mm]
+    double filteredMm = 0.0;      ///< 滤波后距离 [mm]
+    bool observationValid = false;///< 本帧原始回波是否有效
+    bool valid = false;           ///< 最近有效回波是否仍在 maxAge 内
+    bool fresh = false;           ///< 是否在新鲜窗口内
+    std::uint32_t ageMs = 0;      ///< 距最近有效回波的时间 [ms]
+    std::uint32_t lastGoodMs = 0;
 };
 
 /// 车道保持状态快照（只读）。
 struct LaneKeeperState {
-    core::MotionCommand base{};     ///< 调用者输入的基础命令（车体坐标）
-    /// 输出命令：基础 vx/vy 按状态限速后叠加横向纠偏；omega 原样透传。
-    /// 最终航向修正后的 omega 由 Chassis 的 IMU 航向 PID 产生。
-    core::MotionCommand command{};
+    core::MotionCommand base{};     ///< 上游基础命令（车体坐标）
+    core::MotionCommand command{};  ///< base + 横向 delta；omega 透传
 
-    LaneState state = LaneState::kDisabled;
+    LaneMode mode = LaneMode::kDisabled;
     LaneReason reason = LaneReason::kNone;
     bool enabled = false;
     bool configValid = false;
-    bool active = false;            ///< 本周期是否允许墙距纠偏
-    bool valid = false;             ///< 输入/输出有限且配置合法
-    bool turning = false;
+    bool active = false;       ///< 本周期是否在输出横向修正/缓释
+    bool valid = false;        ///< 输入/输出有限且配置合法
+    bool pairValid = false;
+    bool corridor = false;     ///< 双墙通道可信
+    bool corridorWidthValid = false;
     bool degraded = false;
-    bool fault = false;
+    bool decay = false;        ///< 丢墙保持：正在缓释旧纠偏
+    bool fallbackPair = false; ///< 无通道方向时按物理左右/前后墙自动选对
     bool headingValid = false;
-    bool headingStable = true;
 
-    std::int8_t group = -1;         ///< 0=A,1=B,-1=未选
+    int group = -1;            ///< 0=A,1=B,-1=未选
     bool groupChanged = false;
-    bool stateChanged = false;
+    bool modeChanged = false;
     std::uint32_t transitionCount = 0;
 
-    WallDebug walls[kSensorCount]{};  ///< 逻辑 S0..S3
+    ChannelDebug channels[kSensorCount]{};  ///< 逻辑 S0..S3
 
-    bool leftObserved = false;      ///< 运动左法向是否有可用墙距
-    bool rightObserved = false;
-    /// 运动左/右法向的原始距离 <20 mm：连续确认后进入 TOO_CLOSE 主动远离。
+    int leftSensor = -1;
+    int rightSensor = -1;
+    double pairScore = 0.0;
+    double normalX = 0.0;      ///< 运动左法向
+    double normalY = 0.0;
+
+    bool leftValid = false;
+    bool rightValid = false;
     bool leftTooClose = false;
     bool rightTooClose = false;
-    bool corridorActive = false;   ///< 双墙走廊门控：两侧原始距离都 <150 mm
-    /// 物理左侧/右侧（逻辑 S1/S3）的最新原始距离，独立于当前运动组；
-    /// 用于 UI 同时显示两侧距离（过近时仍保留原始值）。
+    double leftMm = -1.0;      ///< 控制侧滤波距离 [mm]
+    double rightMm = -1.0;
+    double leftRawMm = -1.0;   ///< 控制侧原始有效距离 [mm]
+    double rightRawMm = -1.0;
+
+    /// 物理左/右（逻辑 S1/S3）最新原始距离，独立于当前运动组；
+    /// 用于 UI 同时显示两侧距离，过近时仍保留原始值。
     double sideLeftRawMm = -1.0;
     double sideRightRawMm = -1.0;
-    double leftDistanceMm = -1.0;   ///< 左传感器滤波距离 [mm]（PID 控制量）
-    double rightDistanceMm = -1.0;
-    double leftRawMm = -1.0;        ///< 左传感器最近原始有效距离 [mm]（积分门控）
-    double rightRawMm = -1.0;
-    double leftReferenceM = -1.0;   ///< 车体中心->左墙垂距 [m]（双墙/宽度检查）
-    double rightReferenceM = -1.0;
-    double corridorWidthM = -1.0;   ///< 左+右垂距 [m]，-1=不可用
-    bool corridorWidthValid = false;///< 宽度是否在配置的合理通道范围内
 
-    double targetWallMm = 0.0;      ///< 单墙目标（原始测距）[mm]
-    double lateralErrorMm = 0.0;    ///< 墙距 PID 误差，向右为正 [mm]
-    PidDebug wallPid{};             ///< 墙距 PID 内部量
-    double lateralTargetMps = 0.0;  ///< 限幅后、平滑前的目标纠偏 [m/s]，向右为正
-    double lateralCorrectionMps = 0.0;  ///< 实际施加纠偏 [m/s]，向右为正
-
-    double stateSpeedScale = 1.0;   ///< 状态机给出的基础速度比例
-    double targetSpeedScale = 1.0;  ///< 状态*前向安全后的目标比例
-    double speedScale = 1.0;        ///< 实际施加比例（带变化率限幅）
-    double forwardSafetyScale = 1.0;
-    double motionObstacleMm = -1.0; ///< 运动方向最近障碍 [mm]，-1=未测/不适用
+    double corridorWidthM = -1.0;  ///< 左+右几何宽度 [m]，-1=不可用
+    double centerErrorMm = 0.0;    ///< (右墙距-左墙距)/2，向右为正 [mm]
+    PidDebug pd{};                 ///< 横向 PD 内部量
+    double lateralTargetMps = 0.0; ///< 限幅后、平滑前目标 [m/s]，向右为正
+    double lateralCorrectionMps = 0.0;  ///< 实际施加修正 [m/s]，向右为正
+    double quality = 0.0;          ///< 1=TRACKING, 0.5=DEGRADED/TOO_CLOSE
 
     std::uint32_t timestampMs = 0;
 };
@@ -115,14 +109,14 @@ public:
     /**
      * @param bodyCommand 基础运动命令（车体坐标，omega 原样透传）
      * @param ranges      四路测距快照（前/后/左/右）
-     * @param heading     当前航向/角速度（IMU 契约；可 invalid）
+     * @param heading     航向状态（仅诊断；v2.1 LaneKeeper 不用航向做速度门控）
      * @param dt          控制周期 [s]
      */
     void update(const core::MotionCommand& bodyCommand,
                 const core::RangeSnapshot& ranges,
                 const core::HeadingState& heading, double dt);
 
-    /// 安全复位：清滤波/墙体确认/PID/组/状态机历史（disabled 时调用）。
+    /// 安全复位：清滤波/近壁分类/PD/组/模式历史。
     void reset();
 
     const LaneKeeperState& getState() const { return state_; }
@@ -132,31 +126,42 @@ public:
     bool enable = false;
 
 private:
-    bool referenceClearanceM(int sensor, double nX, double nY,
-                             std::uint32_t nowMs, double* outM) const;
-    double forwardSafetyScale(const core::MotionCommand& base,
-                              std::uint32_t nowMs,
-                              double* obstacleMm) const;
+    struct PairEvaluation {
+        RangeChannelValue left{};
+        RangeChannelValue right{};
+        double qLeft = 0.0;
+        double qRight = 0.0;
+        double widthM = -1.0;
+        bool widthValid = false;
+        bool credible = false;
+    };
+
     void resetControl();
+    void fillChannelDebug(std::uint32_t nowMs);
+    double sideRawMm(int logicalSensor, std::uint32_t nowMs) const;
+    PairEvaluation evaluatePair(const PairSelection& pair,
+                                std::uint32_t nowMs) const;
+    PairSelection fallbackPair(std::uint32_t nowMs, bool* used) const;
 
     LaneConfig config_{};
     LaneKeeperState state_{};
 
-    WallTracker walls_[kSensorCount]{};
-    RangeFilter filters_[kSensorCount]{};
-    Pid wallPid_{};
+    RangeChannel channels_[kSensorCount]{};
+    Pid pd_{};
     SensorGroupSelector selector_{};
     LaneStateMachine stateMachine_{};
 
-    int leftSensor_ = -1;
-    int rightSensor_ = -1;
-    std::int8_t lastGroup_ = -1;
-    double lastLateralCorrectionMps_ = 0.0;
-    double lastSpeedScale_ = 1.0;
+    double lastCorrectionMps_ = 0.0;
+    double trackDirX_ = 0.0;
+    double trackDirY_ = 0.0;
+    bool hasTrackDir_ = false;
+    bool wasCredible_ = false;
+    LaneMode lastMode_ = LaneMode::kDisabled;
+    int lastPairKey_ = -1;
+    std::uint32_t transitionCount_ = 0;
 
     bool initialized_ = false;
     bool configValid_ = false;
-    std::uint32_t transitionCount_ = 0;
 };
 
 }  // namespace lane

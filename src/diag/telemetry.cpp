@@ -134,31 +134,34 @@ void printTuneFrame(const chassis::ChassisState &c, const imu::ImuState &is,
 }
 
 constexpr int kLaneFieldCount = 30;
+constexpr int kSafetyFieldCount = 3;
 
 void addLaneFields(FrameBuffer &frame, const lane::LaneKeeperState *l) {
     // $D 追加字段（顺序固定，主机端 test/distance_monitor.py 按同一顺序解析）：
-    //   1 laneMode/state
-    //   2 laneGroup
-    //   3 wallMask        墙存在位（逻辑 S0..S3）
-    //   4 usableMask      可控制位（Present && filter fresh）
-    //   5 leftMm          运动左传感器滤波距离（PID 原始量）
+    //   1 laneMode         0=关 1=NO_PAIR 2=INSUFFICIENT_DATA 3=NO_CORRIDOR
+    //                      4=TRACKING 5=DEGRADED 6=TOO_CLOSE
+    //   2 laneGroup        -1=未选 0=A(前后) 1=B(左右)
+    //   3 nearMask         近壁分类 NEAR_RETURN 位（逻辑 S0..S3）
+    //   4 validMask        最近有效回波仍在 maxAge 内
+    //   5 leftMm           运动左传感器滤波距离
     //   6 rightMm
-    //   7 errMm           墙距 PID 误差，向右为正
-    //   8 pMms  9 iMms  10 dMms  11 corrMms
-    //  12 outVxMms 13 outVyMms 14 outOmegaMradS（LaneKeeper 输出；最终 omega 见 $P.tw）
-    //  15..18 filterS0..S3 滤波后距离（逻辑 S0..S3 = 前/左/后/右）
-    //  19 filterValidMask
-    //  20 targetWallMm
+    //   7 centerErrMm      0.5*(右墙距-左墙距)，向右为正
+    //   8 pMms 9 iMms 10 dMms 11 corrMms
+    //  12 outVxMms 13 outVyMms 14 outOmegaMradS
+    //  15..18 filterS0..S3 滤波距离（逻辑 S0..S3 = 前/左/后/右）
+    //  19 freshMask        新鲜度窗口位
+    //  20 leftClass        左控制通道 NearClass
     //  21 corridorWidthMm
     //  22 laneReason
-    //  23 speedScaleMilli
-    //  24 forwardScaleMilli
-    //  25 motionObstacleMm
+    //  23 qualityMilli     1.0=TRACKING, 0.5=DEGRADED/TOO_CLOSE
+    //  24 rightClass       右控制通道 NearClass
+    //  25 pairScoreMilli   max(|法向·传感器轴|)
     //  26 laneFlags
-    //  27 sideLeftRawMm   物理左侧原始距离（过近时仍有效，便于 UI）
-    //  28 sideRightRawMm  物理右侧原始距离
-    //  29 pidTargetMmS    墙距/过近控制的目标横向速度（限幅后、限速前）
-    //  30 tooCloseMask    bit0=左过近，bit1=右过近
+    //  27 sideLeftRawMm    物理左侧（S1）最近原始距离
+    //  28 sideRightRawMm   物理右侧（S3）
+    //  29 targetMmS        限幅后、平滑前的横向目标
+    //  30 tooCloseMask     bit0=左过近，bit1=右过近
+    // 之后 3 个安全层字段：scaleMilli / nearestMm / flags
     if (l == nullptr) {
         for (int i = 0; i < kLaneFieldCount; ++i) {
             frame.add(-1);
@@ -166,67 +169,72 @@ void addLaneFields(FrameBuffer &frame, const lane::LaneKeeperState *l) {
         return;
     }
 
-    int wallMask = 0;
-    int usableMask = 0;
-    int filterValidMask = 0;
+    int nearMask = 0;
+    int validMask = 0;
+    int freshMask = 0;
     for (int i = 0; i < lane::kSensorCount; ++i) {
-        if (l->walls[i].status == lane::WallStatus::kPresent) {
-            wallMask |= (1 << i);
+        const lane::ChannelDebug &c = l->channels[i];
+        if (c.state == lane::NearClass::kNearReturn) {
+            nearMask |= (1 << i);
         }
-        if (l->walls[i].usable) {
-            usableMask |= (1 << i);
+        if (c.valid) {
+            validMask |= (1 << i);
         }
-        if (l->walls[i].filterValid) {
-            filterValidMask |= (1 << i);
+        if (c.fresh) {
+            freshMask |= (1 << i);
         }
     }
 
     int flags = 0;
     if (l->active) flags |= 1 << 0;
-    if (l->turning) flags |= 1 << 1;
-    if (l->degraded) flags |= 1 << 2;
-    if (l->fault) flags |= 1 << 3;
-    if (l->stateChanged) flags |= 1 << 4;
+    if (l->degraded) flags |= 1 << 1;
+    if (l->leftTooClose || l->rightTooClose) flags |= 1 << 2;
+    if (l->pairValid) flags |= 1 << 3;
+    if (l->modeChanged) flags |= 1 << 4;
     if (l->groupChanged) flags |= 1 << 5;
     if (l->headingValid) flags |= 1 << 6;
-    if (l->headingStable) flags |= 1 << 7;
-    if (l->corridorWidthValid) flags |= 1 << 8;
-    if (l->corridorActive) flags |= 1 << 9;
+    if (l->corridorWidthValid) flags |= 1 << 7;
+    if (l->corridor) flags |= 1 << 8;
+    if (l->decay) flags |= 1 << 9;
+    if (l->fallbackPair) flags |= 1 << 10;
 
-    frame.add(static_cast<int>(l->state));
-    frame.add(static_cast<int>(l->group));
-    frame.add(wallMask);
-    frame.add(usableMask);
-    frame.add(l->leftObserved
-                  ? static_cast<int>(l->leftDistanceMm)
-                  : -1);
-    frame.add(l->rightObserved
-                  ? static_cast<int>(l->rightDistanceMm)
-                  : -1);
-    frame.add(static_cast<int>(l->lateralErrorMm));
-    frame.add(static_cast<int>(l->wallPid.pTerm * 1000.0));
-    frame.add(static_cast<int>(l->wallPid.iTerm * 1000.0));
-    frame.add(static_cast<int>(l->wallPid.dTerm * 1000.0));
+    const int leftClass =
+        (l->leftSensor >= 0 && l->leftSensor < lane::kSensorCount)
+            ? static_cast<int>(l->channels[l->leftSensor].state)
+            : -1;
+    const int rightClass =
+        (l->rightSensor >= 0 && l->rightSensor < lane::kSensorCount)
+            ? static_cast<int>(l->channels[l->rightSensor].state)
+            : -1;
+
+    frame.add(static_cast<int>(l->mode));
+    frame.add(l->group);
+    frame.add(nearMask);
+    frame.add(validMask);
+    frame.add(l->leftValid ? static_cast<int>(l->leftMm) : -1);
+    frame.add(l->rightValid ? static_cast<int>(l->rightMm) : -1);
+    frame.add(static_cast<int>(l->centerErrorMm));
+    frame.add(static_cast<int>(l->pd.pTerm * 1000.0));
+    frame.add(static_cast<int>(l->pd.iTerm * 1000.0));
+    frame.add(static_cast<int>(l->pd.dTerm * 1000.0));
     frame.add(static_cast<int>(l->lateralCorrectionMps * 1000.0));
     frame.add(static_cast<int>(l->command.vx * 1000.0));
     frame.add(static_cast<int>(l->command.vy * 1000.0));
     frame.add(static_cast<int>(l->command.omega * 1000.0));
     for (int i = 0; i < lane::kSensorCount; ++i) {
-        frame.add(l->walls[i].filterValid
-                      ? static_cast<int>(l->walls[i].filteredMm)
+        frame.add(l->channels[i].valid
+                      ? static_cast<int>(l->channels[i].filteredMm)
                       : -1);
     }
-    frame.add(filterValidMask);
-    frame.add(static_cast<int>(l->targetWallMm));
+    frame.add(freshMask);
+    frame.add(leftClass);
     frame.add(l->corridorWidthValid
                   ? static_cast<int>(l->corridorWidthM * 1000.0)
                   : -1);
     frame.add(static_cast<int>(l->reason));
-    frame.add(static_cast<int>(l->speedScale * 1000.0));
-    frame.add(static_cast<int>(l->forwardSafetyScale * 1000.0));
-    frame.add(l->motionObstacleMm >= 0.0
-                  ? static_cast<int>(l->motionObstacleMm)
-                  : -1);
+    frame.add(static_cast<int>(l->quality * 1000.0));
+    frame.add(rightClass);
+    frame.add(static_cast<int>(l->pairScore * 1000.0));
     frame.add(flags);
 
     frame.add(static_cast<int>(l->sideLeftRawMm));
@@ -238,8 +246,27 @@ void addLaneFields(FrameBuffer &frame, const lane::LaneKeeperState *l) {
     frame.add(tooCloseMask);
 }
 
+void addSafetyFields(FrameBuffer &frame, const safety::SafetyState *s) {
+    if (s == nullptr) {
+        for (int i = 0; i < kSafetyFieldCount; ++i) {
+            frame.add(-1);
+        }
+        return;
+    }
+    int flags = 0;
+    if (s->enabled) flags |= 1 << 0;
+    if (s->configValid) flags |= 1 << 1;
+    if (s->limited) flags |= 1 << 2;
+    if (s->stopped) flags |= 1 << 3;
+    if (s->headingBlocked) flags |= 1 << 4;
+    frame.add(static_cast<int>(s->scale * 1000.0));
+    frame.add(s->nearestMm >= 0.0 ? static_cast<int>(s->nearestMm) : -1);
+    frame.add(flags);
+}
+
 void printDistanceFrame(const distance::DistanceArrayState &d,
                         const lane::LaneKeeperState *l,
+                        const safety::SafetyState *s,
                         std::uint32_t nowMs) {
     FrameBuffer frame("$D", nowMs);
     frame.add(d.installedMask);
@@ -253,6 +280,7 @@ void printDistanceFrame(const distance::DistanceArrayState &d,
         frame.add(r.pluggedType);
     }
     addLaneFields(frame, l);
+    addSafetyFields(frame, s);
     frame.flush();
 }
 
@@ -288,7 +316,8 @@ void Telemetry::update() {
 
     if (config_.enableDistance && sources_.distance != nullptr &&
         due(now, lastDistanceMs_, config_.distancePeriodMs)) {
-        printDistanceFrame(*sources_.distance, sources_.lane, now);
+        printDistanceFrame(*sources_.distance, sources_.lane,
+                           sources_.safety, now);
     }
 
     if (config_.enablePortScan &&

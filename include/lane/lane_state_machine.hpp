@@ -1,30 +1,34 @@
 /**
  * @file lane/lane_state_machine.hpp
- * @brief 单一墙距/车道状态机：DISABLED / ACQUIRING / DUAL_WALL / LEFT_WALL /
- *        RIGHT_WALL / NO_WALL / TURNING / SENSOR_FAULT / TOO_CLOSE。
+ * @brief LaneKeeper v2.1 模式机：只决定“是否居中/是否衰减”，不提供速度比例。
  *
- * 状态机只做“模式 + 权限 + 速度比例 + 复位事件”，不直接算 PID。
- * 墙距 PID 的积分权限、转弯暂停、无墙/故障降级都由这里统一给出。
+ * 模式：
+ *   DISABLED / NO_PAIR / INSUFFICIENT_DATA / NO_CORRIDOR /
+ *   TRACKING / DEGRADED / TOO_CLOSE
+ *
+ * 与旧版的区别：
+ *   - 没有 TURNING / SENSOR_FAULT / LEFT_WALL / RIGHT_WALL / NO_WALL；
+ *     转向与安全停车属于上游路径层和安全层；
+ *   - 不输出 speedScale，LaneKeeper 不改变巡航速度；
+ *   - DEGRADED 有两种：新鲜度不足但仍可信（继续算 PD），以及丢墙后的
+ *     旧纠偏衰减（由 LaneKeeper 按 decayFactor 缓释）。
  */
 #pragma once
 
 #include <cstdint>
 
 #include "lane/lane_config.hpp"
-#include "lane/wall_state.hpp"
 
 namespace lane {
 
-enum class LaneState : std::uint8_t {
+enum class LaneMode : std::uint8_t {
     kDisabled = 0,
-    kAcquiring,
-    kDualWall,
-    kLeftWall,
-    kRightWall,
-    kNoWall,
-    kTurning,
-    kSensorFault,
-    kTooClose,  ///< 单侧/双侧过近：不卡故障，主动向远离近墙方向连续修正
+    kNoPair,
+    kInsufficientData,
+    kNoCorridor,
+    kTracking,
+    kDegraded,
+    kTooClose,
 };
 
 enum class LaneReason : std::uint8_t {
@@ -32,66 +36,38 @@ enum class LaneReason : std::uint8_t {
     kDisabled,
     kConfigInvalid,
     kInputInvalid,
-    kStartup,
-    kStopped,
-    kGroupUnknown,
-    kGroupChanged,
-    kAfterTurn,
-    kWallAcquiring,
-    kCorridorInconsistent,
-    kSensorTimeout,
-    kDualWalls,
-    kLeftOnly,
-    kRightOnly,
-    kNoWalls,
-    kTurning,
+    kNoPair,
+    kInsufficientData,
+    kNoCorridor,
+    kTracking,
     kTooClose,
-    kCorridorInactive,
+    kStaleMeasurement,
+    kLostWallHold,
 };
 
 struct LaneStateInputs {
     bool enabled = false;
     bool configValid = false;
     bool inputValid = false;
-    bool moving = false;
-    bool turning = false;
-    bool headingStable = true;
-    bool groupValid = false;
-    bool groupChanged = false;
-    /// 双墙走廊门控：两侧物理传感器都 <150 mm 且强制 B 组时为 true。
-    bool corridorActive = false;
-    WallStatus leftStatus = WallStatus::kUnknown;
-    WallStatus rightStatus = WallStatus::kUnknown;
-    bool leftUsable = false;
-    bool rightUsable = false;
-    bool corridorWidthValid = false;
-    /// 最新样本是“无目标/超量程”（9999/>2000）：不是 wall_present=false，
-    /// 但可作为“无可观测近墙”的独立证据（超时后允许 NO_WALL/单墙）。
-    bool leftNoTarget = false;
-    bool rightNoTarget = false;
-    /// 最新样本是读取失败/未安装：硬件或遮挡异常，不能当作无墙。
-    /// 过近（kTooClose）单独由 leftTooClose/rightTooClose 表示，不再直接算故障。
-    bool leftSensorError = false;
-    bool rightSensorError = false;
-    /// 最新原始距离 <20 mm（过近）；状态机连续确认后进入 TOO_CLOSE 主动远离。
-    bool leftTooClose = false;
-    bool rightTooClose = false;
-    /// 积分门控使用**原始**有效墙距（严格 <100 mm），不是滤波值。
-    double leftRawMm = -1.0;
-    double rightRawMm = -1.0;
+    bool pairValid = false;
+    bool leftValid = false;
+    bool rightValid = false;
+    bool credible = false;
+    bool tooClose = false;
+    bool bothFresh = false;
+    bool pairChanged = false;
     std::uint32_t nowMs = 0;
 };
 
 struct LaneStateOutput {
-    LaneState state = LaneState::kDisabled;
+    LaneMode mode = LaneMode::kDisabled;
     LaneReason reason = LaneReason::kNone;
     bool stateChanged = false;
-    bool allowLateral = false;
-    bool allowIntegral = false;
-    bool resetPid = false;
+    bool allowCorrection = false;  ///< 允许用新误差计算 PD/过近排斥
+    bool decay = false;            ///< 丢墙保持：按 decayFactor 缓释旧纠偏
     bool degraded = false;
-    bool fault = false;
-    double speedScale = 1.0;
+    double decayFactor = 0.0;      ///< 1 -> 0
+    double quality = 0.0;          ///< 1=TRACKING, 0.5=DEGRADED/TOO_CLOSE
 };
 
 class LaneStateMachine {
@@ -101,28 +77,18 @@ public:
 
     LaneStateOutput update(const LaneStateInputs& inputs);
 
-    LaneState state() const { return state_; }
+    LaneMode mode() const { return mode_; }
 
 private:
-    LaneStateOutput build(LaneState state, LaneReason reason,
+    LaneStateOutput build(LaneMode mode, LaneReason reason,
                           const LaneStateInputs& inputs) const;
-    void enter(LaneState state, const LaneStateInputs& inputs);
+    void enter(LaneMode mode);
 
     LaneConfig config_{};
-    LaneState state_ = LaneState::kDisabled;
-    bool started_ = false;
+    LaneMode mode_ = LaneMode::kDisabled;
     bool stateChanged_ = false;
-    bool hasProblemSince_ = false;
-    std::uint32_t problemSinceMs_ = 0;
-    std::uint32_t acquireUntilMs_ = 0;
-    bool hasLeftNoTarget_ = false;
-    bool hasRightNoTarget_ = false;
-    std::uint32_t leftNoTargetSinceMs_ = 0;
-    std::uint32_t rightNoTargetSinceMs_ = 0;
-    bool hasLeftTooClose_ = false;
-    bool hasRightTooClose_ = false;
-    std::uint32_t leftTooCloseSinceMs_ = 0;
-    std::uint32_t rightTooCloseSinceMs_ = 0;
+    bool everTracked_ = false;
+    std::uint32_t lastTrackMs_ = 0;
 };
 
 }  // namespace lane

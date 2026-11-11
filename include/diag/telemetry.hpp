@@ -25,6 +25,7 @@
 #include "modules/imu.hpp"
 #include "modules/lane_keeper.hpp"
 #include "modules/radio.hpp"
+#include "modules/safety_supervisor.hpp"
 
 namespace diag {
 
@@ -53,6 +54,7 @@ struct TelemetrySources {
     const radio::RadioState* radio = nullptr;
     const distance::DistanceArrayState* distance = nullptr;
     const lane::LaneKeeperState* lane = nullptr;  ///< 可为 nullptr：$D 车道字段填 -1
+    const safety::SafetyState* safety = nullptr;  ///< 可为 nullptr：$D 安全字段填 -1
 };
 
 /**

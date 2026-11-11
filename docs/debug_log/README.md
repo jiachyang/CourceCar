@@ -87,7 +87,7 @@ python3 test/pid_tune.py [串口] [窗口秒数] --csv run.csv   # 实时调参/
 | `imu_config.hpp` | 端口 **6**，`yawSign=1.0`，`mountingYawOffsetRad=+π/4`（车头相对 IMU +x），`dataRateMs=5`，漂移自动测量 2000 ms，角度补偿**关闭** |
 | `radio_config.hpp` | `invertForward/Strafe/Turn=均 true`，`snapLeftStickToAxis=true`，`deadband=0.05` |
 | `distance_config.hpp` | 端口 **7=前、8=后、9=左、10=右**；有效范围 20–2000 mm；20 Hz `$D` 遥测 |
-| `lane_config.hpp` | 默认 S0=前/S1=左/S2=后/S3=右（顶点半径 0.1803 m）；A=前后、B=左右；enter 严格 <100、exit 严格 >150、confirm=3；单墙目标 45 mm（原始距离）；一个墙距 PID，`Ki=0`；<20 mm 进 TOO_CLOSE 主动远离；`layoutVerified=false` |
+| `lane_config.hpp` | 默认 S0=前/S1=左/S2=后/S3=右（顶点半径 0.1803 m）；A=前后、B=左右；近壁 100/150 mm、确认 3 帧、MID 可初始化；双墙宽度 0.37–0.70 m；横向 PD（Ki=0）；<20 mm 进 TOO_CLOSE 主动远离；`layoutVerified=false` |
 | `robot_config.hpp` | `enableImu=true`，`enableImuHeading=true`，驱动/遥控/限速均开；`enableLaneAssist=false` |
 
 ## 8. 本 debug_log 索引

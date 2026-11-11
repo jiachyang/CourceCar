@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V5 LaneKeeper 实时分析 UI：两侧距离 + 墙距/过近 PID 输出。
+"""V5 LaneKeeper v2.1 实时分析 UI：两侧距离 + 横向 PD/过近输出。
 
 用途：
   - 连续显示物理左/右原始距离、控制侧滤波距离、误差、P/I/D、PID 目标/实际；
@@ -19,9 +19,10 @@
 说明：
   - 固件仍是 20 ms 控制周期；UI 约 30 Hz 刷新，不参与控制；
   - 两侧原始距离来自 $D 的 sideLeftRawMm/sideRightRawMm；
-  - 控制左/右是当前运动组选中的左右传感器滤波值（前进=B，横移=A）；
-  - “控制目标”是限幅后、速度比例前的横向目标；“实际”是最终施加值；
-  - TOO_CLOSE 时墙距 PID 被旁路，P/I/D 为 0，横向输出是过近排斥量。
+  - 控制左/右是当前通道对选中的左右传感器滤波值（前进=B，横移=A）；
+  - “控制目标”是限幅后、平滑前的横向目标；“实际”是最终施加值；
+  - TOO_CLOSE 时 PD 被旁路，横向输出是过近排斥量；
+  - LaneKeeper 不改变巡航速度，前向安全由 SafetySupervisor 负责。
 """
 
 import collections
@@ -41,7 +42,8 @@ CSV_FIELDS = [
     "ms", "left_raw", "right_raw", "left_filter", "right_filter",
     "left_ctrl", "right_ctrl", "err_mm", "p_mm_s", "i_mm_s", "d_mm_s",
     "pid_target_mm_s", "corr_mm_s", "out_vx_mm_s", "out_vy_mm_s",
-    "mode", "group", "too_close_mask", "corridor", "reason",
+    "mode", "group", "too_close_mask", "corridor", "fallback", "reason",
+    "safety_scale", "safety_nearest",
 ]
 
 
@@ -72,6 +74,7 @@ def sample_from_frame(frame):
     # readings 顺序 = 前、后、左、右；物理左=S1=index2，物理右=S3=index3
     left_raw = raw_side(2, "side_left_raw_mm")
     right_raw = raw_side(3, "side_right_raw_mm")
+    safety = frame.get("safety") or {}
     return {
         "ms": frame["ms"],
         "left_raw": left_raw,
@@ -80,7 +83,7 @@ def sample_from_frame(frame):
         "right_filter": _num(lane, "filter_s3_mm", -1),
         "left_ctrl": _num(lane, "left_mm", -1),
         "right_ctrl": _num(lane, "right_mm", -1),
-        "err_mm": _num(lane, "lane_err_mm", 0),
+        "err_mm": _num(lane, "center_err_mm", 0),
         "p_mm_s": _num(lane, "lane_p_mm_s", 0),
         "i_mm_s": _num(lane, "lane_i_mm_s", 0),
         "d_mm_s": _num(lane, "lane_d_mm_s", 0),
@@ -91,8 +94,11 @@ def sample_from_frame(frame):
         "mode": _num(lane, "lane_mode", -1),
         "group": _num(lane, "lane_group", -1),
         "too_close_mask": _num(lane, "too_close_mask", 0),
-        "corridor": 1 if (_num(lane, "lane_flags", 0) & (1 << 9)) else 0,
+        "corridor": 1 if (_num(lane, "lane_flags", 0) & (1 << 8)) else 0,
+        "fallback": 1 if (_num(lane, "lane_flags", 0) & (1 << 10)) else 0,
         "reason": _num(lane, "lane_reason", -1),
+        "safety_scale": _num(safety, "safety_scale_milli", 1000) / 1000.0,
+        "safety_nearest": _num(safety, "safety_nearest_mm", -1),
     }
 
 
@@ -246,7 +252,7 @@ def run_ui(port, span_s, csv_path):
             s = samples[-1]
             state_lbl.configure(
                 text=(f"{mode_name(s['mode'])}  /  group={group_name(s['group'])}  "
-                      f"corridor={s['corridor']}  "
+                      f"corridor={s['corridor']} fallback={s['fallback']}  "
                       f"tooClose=0b{s['too_close_mask'] & 3:02b}  "
                       f"reason={dm.LANE_REASON_NAMES.get(s['reason'], s['reason'])}"))
             dist_lbl.configure(
@@ -258,12 +264,16 @@ def run_ui(port, span_s, csv_path):
                 text=(f"P/I/D = {s['p_mm_s']:+d} / {s['i_mm_s']:+d} / "
                       f"{s['d_mm_s']:+d} mm/s\n"
                       f"控制目标 = {s['pid_target_mm_s']:+d} mm/s   "
-                      f"实际修正 = {s['corr_mm_s']:+d} mm/s   "
-                      f"输出 vx={s['out_vx_mm_s']} vy={s['out_vy_mm_s']} mm/s"))
+                      f"实际修正 = {s['corr_mm_s']:+d} mm/s\n"
+                      f"输出 vx={s['out_vx_mm_s']} vy={s['out_vy_mm_s']} mm/s   "
+                      f"安全层 scale={s['safety_scale']:.2f} "
+                      f"最近障碍={s['safety_nearest']} mm"))
             if s["too_close_mask"]:
-                warn_lbl.configure(text="⚠ 过近：自动居中/远离；不是故障停车")
-            elif s["mode"] == 7:
-                warn_lbl.configure(text="⚠ SENSOR_FAULT：按配置减速/停车")
+                warn_lbl.configure(text="⚠ 过近：LaneKeeper 只做横向远离；前向安全由安全层负责")
+            elif s["mode"] == 2:
+                warn_lbl.configure(text="⚠ 数据不足：不猜墙、不纠偏")
+            elif s["mode"] == 3:
+                warn_lbl.configure(text="⚠ 非走廊：宽度/分类不满足，不纠偏")
             else:
                 warn_lbl.configure(text="")
             data = list(samples)

@@ -1,6 +1,6 @@
 /**
  * @file tests/native/test_sensor_group_selector.cpp
- * @brief 测距组选择测试：前后=A、左右=B，前进/后退/横移/斜向/零速/转弯。
+ * @brief v2.1 通道选对：前后运动用左右组、横移用前后组、斜向不硬选。
  */
 #include <cassert>
 #include <cmath>
@@ -21,94 +21,102 @@ lane::SensorGroupSelector makeSelector() {
 }  // namespace
 
 int main() {
-    // --- 前进：左右组 B，left=S1(左)，right=S3(右) ---
+    // --- 前进：Group B，左=S1，右=S3，法向 +Y ---
     {
         auto s = makeSelector();
-        const auto g = s.select(0.30, 0.0, 20, false);
-        assert(g.group == lane::kGroupB);
-        assert(g.leftSensor == lane::kS1);
-        assert(g.rightSensor == lane::kS3);
-        assert(g.changed);
+        const auto p = s.select(0.30, 0.0, true);
+        assert(p.valid);
+        assert(p.group == lane::kGroupB);
+        assert(p.leftSensor == lane::kS1);
+        assert(p.rightSensor == lane::kS3);
+        assert(std::fabs(p.leftNormalX) < 1e-12);
+        assert(std::fabs(p.leftNormalY - 1.0) < 1e-12);
     }
 
-    // --- 左移：前后组 A，运动左侧=后(S2)，右侧=前(S0) ---
+    // --- 后退：Group B，但左右对调 ---
     {
         auto s = makeSelector();
-        const auto g = s.select(0.0, 0.30, 20, false);
-        assert(g.group == lane::kGroupA);
-        assert(g.leftSensor == lane::kS2);
-        assert(g.rightSensor == lane::kS0);
+        const auto p = s.select(-0.30, 0.0, true);
+        assert(p.group == lane::kGroupB);
+        assert(p.leftSensor == lane::kS3);
+        assert(p.rightSensor == lane::kS1);
     }
 
-    // --- 右移：前后组 A，运动左侧=前(S0)，右侧=后(S2) ---
+    // --- 左移：Group A，运动左=S2(后)，右=S0(前) ---
     {
         auto s = makeSelector();
-        const auto g = s.select(0.0, -0.30, 20, false);
-        assert(g.group == lane::kGroupA);
-        assert(g.leftSensor == lane::kS0);
-        assert(g.rightSensor == lane::kS2);
+        const auto p = s.select(0.0, 0.30, true);
+        assert(p.group == lane::kGroupA);
+        assert(p.leftSensor == lane::kS2);
+        assert(p.rightSensor == lane::kS0);
+        assert(std::fabs(p.leftNormalX + 1.0) < 1e-12);
     }
 
-    // --- 后退：左右组 B，但左右对调 ---
+    // --- 右移：Group A，运动左=S0(前)，右=S2(后) ---
     {
         auto s = makeSelector();
-        const auto g = s.select(-0.30, 0.0, 20, false);
-        assert(g.group == lane::kGroupB);
-        assert(g.leftSensor == lane::kS3);  // 车体右 = 倒车左侧
-        assert(g.rightSensor == lane::kS1); // 车体左 = 倒车右侧
+        const auto p = s.select(0.0, -0.30, true);
+        assert(p.group == lane::kGroupA);
+        assert(p.leftSensor == lane::kS0);
+        assert(p.rightSensor == lane::kS2);
+        assert(std::fabs(p.leftNormalX - 1.0) < 1e-12);
     }
 
-    // --- 45° 斜向：两组都不到 0.90 -> 不选 ---
+    // --- 45° 斜向：两组都不到 0.82 -> 不选 ---
     {
         auto s = makeSelector();
-        const auto g = s.select(0.30, 0.30, 20, false);
-        assert(g.group == -1);
-        assert(g.leftSensor == -1);
-        assert(g.rightSensor == -1);
+        const auto p = s.select(0.30, 0.30, true);
+        assert(!p.valid);
+        assert(p.group == -1);
+        assert(p.leftSensor == -1);
     }
 
-    // --- 零速：不选组，且第二次不重复报 changed ---
+    // --- 30°：|t·左/右轴| ≈ 0.866 >= 0.82 -> 仍可选 B ---
     {
         auto s = makeSelector();
-        auto g = s.select(0.30, 0.0, 20, false);
-        assert(g.group == lane::kGroupB);
-        g = s.select(0.0, 0.0, 40, false);
-        assert(g.group == -1);
-        assert(g.changed);
-        g = s.select(0.0, 0.0, 60, false);
-        assert(g.group == -1);
-        assert(!g.changed);
-        g = s.select(0.30, 0.0, 80, false);
-        assert(g.group == lane::kGroupB);
-        assert(g.changed);
+        const double a = 30.0 * lane::kPi / 180.0;
+        const auto p = s.select(std::cos(a), std::sin(a), true);
+        assert(p.valid);
+        assert(p.group == lane::kGroupB);
+        assert(p.score >= 0.82);
     }
 
-    // --- 转弯：不选组 ---
+    // --- 无方向/零向量：不选组 ---
     {
         auto s = makeSelector();
-        s.select(0.30, 0.0, 20, false);
-        const auto g = s.select(0.30, 0.0, 40, true);
-        assert(g.group == -1);
-        assert(g.changed);
+        auto p = s.select(0.30, 0.0, true);
+        assert(p.valid);
+        p = s.select(0.0, 0.0, false);
+        assert(!p.valid);
+        p = s.select(0.0, 0.0, false);
+        assert(!p.valid);
+        p = s.select(0.0, 0.0, true);
+        assert(!p.valid);
     }
 
-    // --- 车体坐标 vs 世界坐标 ---
+    // --- 同一方向重复选择结果稳定；换方向换组 ---
     {
-        // 车体原地转 90° 后仍沿车头前进：车体命令不变 -> 仍选左右组 B
         auto s = makeSelector();
-        const auto g = s.select(0.30, 0.0, 20, false);
-        assert(g.group == lane::kGroupB);
+        auto p1 = s.select(0.30, 0.0, true);
+        auto p2 = s.select(0.30, 0.0, true);
+        assert(p1.valid && p2.valid);
+        assert(p1.group == p2.group);
+        assert(p1.leftSensor == p2.leftSensor);
+        auto p3 = s.select(0.0, 0.30, true);
+        assert(p3.valid);
+        assert(p3.group == lane::kGroupA);
     }
+
+    // --- 世界方向先转车体：转 90° 后世界 +X 变成车体 -Y（右移） ---
     {
-        // 世界 +X 固定，车体转 90° -> 车体命令向右 -> 前后组 A
-        auto s = makeSelector();
-        const auto world = core::MotionCommand{0.30, 0.0, 0.0};
-        const auto body = lane::worldVelocityToBody(
-            world, 1.5707963267948966);
+        const core::MotionCommand world{0.30, 0.0, 0.0};
+        const core::MotionCommand body =
+            lane::worldVelocityToBody(world, lane::kPi / 2.0);
         assert(std::fabs(body.vx) < 1e-12);
         assert(body.vy < 0.0);
-        const auto g = s.select(body.vx, body.vy, 20, false);
-        assert(g.group == lane::kGroupA);
+        auto s = makeSelector();
+        const auto p = s.select(body.vx, body.vy, true);
+        assert(p.group == lane::kGroupA);
     }
 
     std::printf("sensor group selector tests: ALL PASS\n");

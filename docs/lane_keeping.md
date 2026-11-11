@@ -1,345 +1,346 @@
-# 四距离传感器自适应车道保持（LaneKeeper）
+# 车道保持 v2.1（RangeAware LaneKeeper）
 
-> 状态：**主机测试通过；旧版双墙已在实车短时触发；TOO_CLOSE/新 UI 尚未上机验证**。
-> 范围：局部运动纠偏，不替代全局路径规划、不做定位/EKF、不直接控制四个电机。
-> 相关需求：`docs/chassis_requirements.md` §LANE；接线：`docs/车辆配置.md`；
-> 数据流：`docs/architecture.md`。
-
----
-
-## 1. 目标与边界
-
-默认 `corridorOnly=true`：**只有物理左/右两侧原始距离都 <150 mm** 时才启用墙距控制；
-单侧/无墙不纠偏。进入双墙走廊后，即使停车也保持双墙模式/PID，并以不超过
-`standstillMaxCorrectionMps=0.08 m/s` 的速度自动居中/远离过近侧；长时间
-运行不会因为速度=0 退回“识别”。门控关闭
-（`corridorOnly=false`）时保留旧的单墙/无墙回退，仅用于主机测试/特殊场地。
-
-在双墙走廊内，利用四路 V5 Distance Sensor 中与运动方向垂直的一组相对传感器：
-
-- 两侧都能看到近墙 -> **双墙居中 PID**；
-- 只有一侧能看到近墙、另一侧已确认无墙 -> **单墙跟随 PID**；
-- 两侧都确认无墙 -> **NO_WALL**，不做横向纠偏；
-- 运动方向与两组测距轴都近似 45° -> **不选组、进入 ACQUIRING**；
-- 单侧/双侧原始距离 `<20 mm` -> **TOO_CLOSE**，主动向远离近墙方向修正，不卡住；
-- 读取失败/未安装持续异常 -> **SENSOR_FAULT**，按配置减速/停止。
-
-本模块只输出车体平移修正；旋转仍由 Chassis 的既有 IMU 航向 PID 产生：
-
-```
-Radio / 未来自主规划
-        │ core::MotionCommand(base, 车体坐标)
-        ▼
-   LaneKeeper ──(vx, vy, omega 原样透传)──► Chassis
-        ▲                                     ├─ IMU 航向 PID（既有 HeadingController）
-        │ core::RangeSnapshot                 ├─ X-Drive IK（既有 kinematics）
-   DistanceArray                              └─ ChassisDrive → 四电机
-```
-
-因此：
-
-- **没有重写 X-Drive IK**；
-- **没有重写 IMU 航向 PID**：`omega` 由 Chassis 的既有航向环产生，
-  LaneKeeper 只改 `vx/vy`；
-- LaneKeeper 不访问任何硬件，可在主机端完整测试。
-
-> `vx` 来自上游基础命令（遥控/全局规划），LaneKeeper **不生成巡航速度**；
-> 它只按状态/前向安全做限速，再叠加横向纠偏。
+> 参考：`LaneKeeping_V2_1_RangeAware`（2026-11-11）。
+> 状态：**主机测试通过；未上机验证**。传感器安装几何、PD、通道宽度和
+> 安全制动参数均未实车标定；不能声称“实车车道保持通过”。
+>
+> 范围：局部横向纠偏。不替代定位/EKF/地图/路径规划，不控制四个电机，
+> 不拥有巡航速度，也不做前向急停。
 
 ---
 
-## 2. 坐标、单位与传感器几何
+## 1. v2.1 的核心变化
 
-### 2.1 坐标约定（沿用现有工程）
+旧版把“墙是否存在”“近壁”“无目标”和“前向安全”混在 LaneKeeper 内部。
+v2.1 改为：
 
-- 车体：`+X = 车头`，`+Y = 车体左侧`，`+Z = 竖直向上`；
-- 角度：逆时针为正（从 +X 转向 +Y）；
-- `MotionCommand`：`vx [m/s]` 车头、`vy [m/s]` 车体左侧、`omega [rad/s]` 逆时针；
-- 内部墙距/阈值/滤波统一 **mm**，安装位置/参考垂距用 **m**。
+1. **原始 ToF 是完整物理测量**。1.5 m / 1.9 m 的回波仍然有效，不能因为
+   超过 150 mm 就写成 `ABSENT` 或 `NO_TARGET`；
+2. 150 mm 只是 **LaneKeeper 内部近壁分类阈值**。`FAR_RETURN` 表示“有有效
+   远距离回波”，不是“墙不存在”；`UNKNOWN` 表示近窗内没有可用数据，
+   不是“空间畅通”；
+3. 100–150 mm 首次观测连续 3 帧后进入 `MID_RETURN`，可以正常参与双墙判定，
+   修复“上电落在滞回带 -> 永远 Unknown -> 故障”的问题；
+4. **LaneKeeper 只输出横向 delta**：不修改巡航速度、不输出 `speedScale`、
+   不做前向停车；前向 ToF 限速由独立 `SafetySupervisor` 负责；
+5. 组选择使用**稳定通道方向**，不是每帧修正后的瞬时速度；没有新方向时
+   沿用最后一次平移方向，停车仍可居中；
+6. 墙距控制改为 PD（默认 Ki=0），降低对噪声的 D 敏感度；丢墙后按
+   `degradedHoldMs` 缓释旧纠偏，不因单帧丢数重置。
 
-> 任务书 §2.1 建议 `+vy = 车体右方`；现有工程已确认 `+vy = 车体左侧`
-> （`docs/车辆配置.md` §1，CS-007）。本实现**沿用现有约定**，没有改 IK 符号。
-> LaneKeeper 内部墙距误差采用“**向右为正**”的约定（与任务书 §7/8 一致），
-> 最后通过右法向 `r=(dY,-dX)` 转回车体 `vx/vy`，不修改底盘符号。
+---
 
-### 2.2 传感器在四个顶点，不在轮子 45° 边中点
+## 2. 数据流与职责
 
-根据用户提供的俯视图，4 个 ToF 在正方形车架的**四个顶点**：
+```
+Radio / 未来规划
+      │ core::MotionCommand(base, 车体)
+      ▼
+ LaneKeeper ──(base + 横向 delta, omega 透传)──► SafetySupervisor
+      ▲                                              │ ToF 制动/航向门控
+      │ core::RangeSnapshot                          ▼
+ DistanceArray ────────────────────────────────► Chassis
+                                                    ├ IMU 航向 PID
+                                                    └ X-Drive IK → 四电机
+```
 
-- 车头、车尾、左侧、右侧；
-- 出射轴沿车体 ±X / ±Y；
-- 顶点半径 = 框架边长/√2 = 0.255/1.414 ≈ **0.1803 m**；
-- 轮子在四条边的中点（45° 位置），与测距安装点不是同一位置。
+- LaneKeeper 不访问硬件，可在主机端完整测试；
+- 原始 `RangeSnapshot` 是共享的**只读**测量。LaneKeeper 的 `NearClass`
+  只供自身和诊断使用，定位/地图不得订阅；
+- `omega` 原样透传，航向 PID 仍在 Chassis；
+- 安全层只缩小 `vx/vy`，不改变 `omega`；当前只做 ToF 轴向约束，
+  不含地图扫掠/未知挡板置信边界。
 
-默认映射（**安装点/支架外伸未实测**）：
+### 2.1 与旧版接口的差异
 
-| 逻辑 | 默认物理侧 | Smart Port | rangeSource | 车体位置 `(x,y)` [m] | 出射轴 [rad] | 组 |
+| 旧版 | v2.1 |
+| --- | --- |
+| `LaneState` 9 个状态（含左右单墙/转弯/故障） | `LaneMode` 7 个模式：DISABLED/NO_PAIR/INSUFFICIENT_DATA/NO_CORRIDOR/TRACKING/DEGRADED/TOO_CLOSE |
+| `WallStatus Present/Absent/Unknown` | `NearClass UNKNOWN/NEAR_RETURN/MID_RETURN/FAR_RETURN` |
+| `speedScale`、前向安全、故障停车 | LaneKeeper 不再拥有速度；移到 SafetySupervisor |
+| 单墙跟随、走廊门控、停车自动居中开关 | 双墙可信才纠偏；停车按方向记忆继续居中 |
+| 积分门控、抗饱和 | PD，默认 Ki=0；保留 PID 结构但不再使用积分 |
+
+---
+
+## 3. 坐标、单位与传感器几何
+
+- 车体：`+X = 车头`，`+Y = 车体左侧`，`+Z` 向上；逆时针为正；
+- `MotionCommand.vx/vy` 车体坐标；内部距离统一 mm，位置/宽度用 m；
+- 横向误差/修正采用“**向右为正**”，最终用右法向 `-t` 映射回车体；
+- 4 个 ToF 在正方形车架四个顶点，出射轴沿 ±X/±Y；
+- 顶点半径 = 0.255/√2 ≈ **0.1803 m**；轮子在四条边中点，不是测距安装点。
+
+默认映射：
+
+| 逻辑 | 物理侧 | Smart Port | rangeSource | 车体位置 `(x,y)` [m] | 出射轴 [rad] | 组 |
 | --- | --- | ---: | ---: | --- | ---: | --- |
-| S0 | 前 | 7 | 0 (前) | `(+0.1803, 0)` | `0` | A |
-| S1 | 左 | 9 | 2 (左) | `(0, +0.1803)` | `+π/2` | B |
-| S2 | 后 | 8 | 1 (后) | `(-0.1803, 0)` | `π` | A |
-| S3 | 右 | 10 | 3 (右) | `(0, -0.1803)` | `-π/2` | B |
+| S0 | 前 | 7 | 0 | `(+0.1803, 0)` | `0` | A |
+| S1 | 左 | 9 | 2 | `(0, +0.1803)` | `+π/2` | B |
+| S2 | 后 | 8 | 1 | `(-0.1803, 0)` | `π` | A |
+| S3 | 右 | 10 | 3 | `(0, -0.1803)` | `-π/2` | B |
 
-- **Group A = S0+S2 = 前+后**；
-- **Group B = S1+S3 = 左+右**；
-- 这与示意图“蓝色 A 组为前后、绿色左右为当前左右组”一致。
-- 实际朝向/位置如果不同，只改 `SensorConfig` 的 `rangeSource/xM/yM/axisRad`，
-  算法不改；被轮子/结构件遮挡可置 `enabled=false`。
-
-### 2.3 单墙目标
-
-`LaneStateConfig::targetWallMm = 45.0` 是**原始传感器距离**目标，不是车体中心到墙：
-
-- 45 cm 通道、顶点半径 0.1803 m 时，居中原始读数约
-  `225 - 180.3 = 44.7 mm`；
-- 任务书示例 `target_wall_mm = 45.0f` 与此一致；
-- 必须按实际通道净宽、车体轮廓、ToF 窗口、机械安全间隙标定；
-- **不得把 100 mm 的墙体识别阈值当作目标墙距**。
+- Group A = S0+S2 = 前后；Group B = S1+S3 = 左右；
+- 实际安装位置/轴向不同，只改 `LaneConfig::sensors[]`，算法不改；
+- `layoutVerified=false` 表示这些值尚未实测。
 
 ---
 
-## 3. 墙体识别：10/15 cm 滞回状态机
+## 4. 单路近壁通道（`RangeChannel`）
 
-已确认参数（不得改成 5 cm）：
+每路独立维护原始有效性、近壁分类、中值/低通滤波和新鲜度。
 
-```cpp
-inline constexpr std::int32_t kWallEnterMm = 100;      // 严格 <100 才累计有墙
-inline constexpr std::int32_t kWallExitMm = 150;       // 严格 >150 才累计无墙
-inline constexpr std::int32_t kWallConfirmCount = 3;   // 连续有效确认样本
-inline constexpr std::uint32_t kWallStaleTimeoutMs = 200;
-inline constexpr std::uint32_t kWallMinSampleIntervalMs = 15;
+### 4.1 有效回波
+
+只有以下样本是**有效物理回波**：
+
+- `RangeStatus::kOk`（20–2000 mm）；
+- `RangeStatus::kTooClose`（<20 mm，距离不可信但确实有物体）。
+
+`kNoTarget`（9999）、`kTooFar`（>2000）、`kReadError`、`kNotInstalled`
+都是“本帧无有效回波”：不进入分类/滤波，不确认“无墙”。
+
+### 4.2 分类（连续确认）
+
+| 原始有效距离 | 分类变化 |
+| --- | --- |
+| `<100 mm` 连续 3 帧 | `NEAR_RETURN` |
+| `>150 mm` 连续 3 帧 | `FAR_RETURN`（有效远距回波） |
+| 100–150 mm（含端点） | 保持原近/远状态；首次观测连续 3 帧进入 `MID_RETURN` |
+| 无有效回波 | 保持旧分类；超过 `maxAgeMs=180` 释放为 `UNKNOWN` |
+
+- `FAR_RETURN` 是真实回波，不是无目标；
+- `UNKNOWN` 不是空间畅通；
+- 100–150 mm 的 `MID_RETURN` 可以作为双墙候选，不能单独证明通道安全。
+
+### 4.3 滤波
+
+- 3 点中值（2 点时取平均，1 点时直通）+ 一阶低通 `alpha=0.45`；
+- 单帧跳变 `>60 mm` 先不改变滤波稳态，连续 2 帧才接受；
+- 跳变确认与近壁分类解耦：分类仍按原始有效回波更新；
+- `fresh` = 最近有效回波年龄 ≤42 ms（约 2 个控制周期）；
+- `valid` = 年龄 ≤180 ms；
+- 重复/乱序时间戳不重复计数。
+
+---
+
+## 5. 通道选对（`SensorGroupSelector`）
+
+设车体通道方向 `d=(dx,dy)`，运动左法向 `t=(-dy,dx)`：
+
+1. `score = max(|d·前后轴|, |d·左右轴|)`，即 `max(|tx|,|ty|)`；
+2. `score < minAxisAlignment=0.82`（约 35°）不选对；45° 斜向不硬选；
+3. 前后运动用 Group B（S1/S3），横向运动用 Group A（S0/S2）；
+4. 两轴中在 `t` 上投影为正的一侧是运动左侧，另一侧是右侧；
+5. 换对后清 PD 微分历史，并让模式机丢弃上一对的 hold 窗口。
+
+方向来源：
+
+- 当前工程没有全局路径层，使用基础命令的非零平移方向；
+- 停车时沿用**最后一次**非零平移方向，因此停车仍可自动居中；
+- 从未移动过（没有方向）且平移速度接近 0 时，按车体物理墙对自动回退：
+  - B 对：S1/S3，法向 `t=(0,1)`；
+  - A 对：S0/S2，法向 `t=(1,0)`；
+  - 只有一对可信就用该对；两对都可信时选“更近的一对”，平局优先 B；
+  - 该回退只用于停车/无方向，不会在 45° 行驶中硬选组；
+- 未来接入路径规划时，应把 `RouteSegment` 的稳定切向量转换到车体后传入，
+  不要使用每帧修正后的实际速度。
+
+---
+
+## 6. 走廊判定
+
+只有在同一通道对上同时满足以下条件才进入双墙控制：
+
+1. 两侧都是有效回波（`valid`）；
+2. 分类不是 `FAR_RETURN` 或 `UNKNOWN`（`NEAR`/`MID` 均可）；
+3. 两侧滤波距离都 `<150 mm`；
+4. 几何宽度在 `[0.37, 0.70] m`：
+
+```
+width = (left_mm + right_mm)/1000
+      + p_left·t + p_right·(-t)
 ```
 
-每个 ToF 独立维护状态与连续计数（`lane::WallTracker`）：
+默认对称安装时最后两项各为 0.1803 m，45 cm 通道：
+`0.045+0.045+0.3606 ≈ 0.4506 m`。
 
-| 样本类型 | 近墙计数 | 远墙计数 | 状态变化 |
-| --- | --- | --- | --- |
-| `kOk` 且 `d < 100` | +1 | 清 0 | 连续 3 次 -> Present |
-| `kOk` 且 `100 <= d <= 150` | 清 0 | 清 0 | 保持原状态（滞回带，含端点） |
-| `kOk` 且 `d > 150` | 清 0 | +1 | 连续 3 次 -> Absent |
-| `kNoTarget` (9999) | 清 0 | 清 0 | `wall_present` 不置 false；超时转 Unknown；状态机另有 no-target 证据计时 |
-| `kTooFar` (>2000) | 清 0 | 清 0 | 同上（不当作有效远墙距离） |
-| `kTooClose` (<20) | 清 0 | 清 0 | 墙体状态不确认；保留原始距离，状态机连续确认后进入 TOO_CLOSE 主动远离 |
-| `kReadError` (PROS_ERR) | 清 0 | 清 0 | **无效样本**；超时转 Unknown |
-| `kNotInstalled` | 清 0 | 清 0 | **无效样本**；超时转 Unknown |
-
-关键语义（完整任务书 §5.4）：
-
-1. **9999 不是“远墙”**：它是无效样本，不确认 `wall_present=false`；
-   持续无效超过 `staleTimeoutMs` 转 `Unknown`。
-   状态机另有一个**独立的 no-target 计时**（`noWallTimeoutMs=120`）：
-   若某侧持续只返回 9999/>2000，则把该侧视为“无可观测近墙”，
-   可进入 `NO_WALL` 或单墙模式；**墙体状态仍是 Unknown**，不是 Absent。
-   这解决了“墙结束/路口返回 9999 时不能一直当作有墙”的问题，同时没有
-   把 9999 直接写成 `wall_present=false`。
-2. **PROS_ERR / <20 / >2000 / 未安装** 同样不确认无墙。
-   `<20 mm` 不是丢弃：过近侧原始值进入 TOO_CLOSE 排斥控制，主动远离；
-   只有读取失败/未安装才按故障处理。
-3. 100–150 mm（含端点）保持原状态，并打断进入/退出连续序列。
-4. 同一时刻/过短间隔的重复样本不重复计数（`minSampleIntervalMs=15`），
-   防止一个控制周期内重复读取快速凑满 3 次。
-5. 静止墙连续返回相同数值是有效的；不能因“数值相同”判无效。
-
-状态机是纯逻辑，`tests/native/test_wall_tracker.cpp` 覆盖 99/100/101、
-149/150/151、9999、PROS_ERR、过近、超量程、重复时间戳和 stale。
+- 单侧远回波、单侧无数据、宽度不合理 -> 不纠偏；
+- `NO_CORRIDOR` = 两侧都有数据但几何/分类不可信；
+- `INSUFFICIENT_DATA` = 至少一侧没有可用数据；
+- 没有单墙跟随/无墙回退；没有“走廊外单侧过近自动远离”。
 
 ---
 
-## 4. 测距组选择
-
-### 4.1 前后=A、左右=B，按运动方向映射左右
-
-车体坐标里的“左/右传感器”是**车体左右**，不是**运动方向左右**：
-
-- 前进时：运动左侧 = 车体左侧（S1），右侧 = 车体右侧（S3） -> **Group B**；
-- 左移时：运动左侧 = 车体后方（S2），右侧 = 车体前方（S0） -> **Group A**；
-- 右移时：运动左侧 = 车体前方（S0），右侧 = 车体后方（S2） -> **Group A**；
-- 倒车时：运动左侧 = 车体右侧（S3），右侧 = 车体左侧（S1） -> **Group B 但左右对调**。
-
-因此必须由“当前目标平移速度方向 + 已标定传感器轴”共同决定，而不是转弯次数。
-
-### 4.2 选择算法（`SensorGroupSelector`）
-
-设车体目标平移方向 `d=(vx,vy)/|v|`，其左法向 `t=(-d_y,d_x)`。对每组两根轴 `a_i`：
-
-1. 两根轴必须近似反向：`a_0·a_1 <= -cos(15°)`；
-2. 两根轴在 `t` 上的投影必须一正一负；
-3. 组得分 `score = min(|a_0·t|, |a_1·t|)`；
-4. 要求 `score >= minAxisAlignment=0.90`（约 25.8°）；
-5. 取两组中得分更高者；带 100 ms 驻留和 0.10 分数回差。
-
-与两组轴都近似 45° 的斜向运动（例如 `(1,1)/√2`）两组得分都约 0.707 < 0.90
--> 不选组，状态机进入 ACQUIRING（限速），不硬选一组。
-
-### 4.3 车体坐标 vs 世界坐标
-
-LaneKeeper 的输入**明确是车体坐标**。如果上游是全局路径规划：
-
-- 世界方向 `w` 必须先用 `lane::worldVelocityToBody(w, headingRad)` 转到车体；
-- 车体原地转 90° 后仍沿车头前进：`d` 在车体坐标中不变 -> **组不变**；
-- 车体转 90°、但世界目标方向不变：`d` 在车体坐标中转了 90° -> **组切换**。
-
-`tests/native/test_sensor_group_selector.cpp` 与 `test_lane_keeper.cpp` 都有断言。
-
----
-
-## 5. 状态机
-
-`lane::LaneState`：
+## 7. 模式机
 
 ```cpp
-DISABLED, ACQUIRING, DUAL_WALL, LEFT_WALL, RIGHT_WALL,
-NO_WALL, TURNING, SENSOR_FAULT, TOO_CLOSE
+DISABLED, NO_PAIR, INSUFFICIENT_DATA, NO_CORRIDOR,
+TRACKING, DEGRADED, TOO_CLOSE
 ```
 
-| 状态 | 进入条件 | 控制权限 / 速度 |
+| 模式 | 条件 | 输出 |
 | --- | --- | --- |
-| DISABLED | 模块关闭 / 配置非法 / 输入非有限 | 透传基础命令（配置非法/非有限时更保守） |
-| ACQUIRING | 启动、组切换、转弯后、方向不适用、测量状态不足 | 无横向纠偏，基础速度 ×0.5（可配） |
-| ACQUIRING（走廊门控未通过） | 两侧物理距离不是都 <150 mm | 仅监控，不纠偏，基础速度 ×1；reason=18 |
-| DUAL_WALL | 左右均 Present、可用、通道宽度合理 | 双墙 PID，速度 ×1 |
-| LEFT_WALL | 左 Present/可用，右 Absent 或“持续无目标”超时 | 左墙 PID，速度 ×1 |
-| RIGHT_WALL | 右 Present/可用，左 Absent 或“持续无目标”超时 | 右墙 PID，速度 ×1 |
-| NO_WALL | 左右均 Absent，或两侧都“持续无目标”超时 | 无横向纠偏，速度 ×1 |
-| TURNING | 基础 omega 或实测 gz 超阈值 | 暂停墙距 PID，清零积分，速度 ×1（可配） |
-| TOO_CLOSE | 单侧/双侧 `<20 mm` 连续确认 | 墙距 PID 旁路；单侧向远离该侧、双侧按差居中；速度 ×0.35（可配） |
-| SENSOR_FAULT | 持续读取失败/未安装，或 Present 但测量长期不可用 | 无横向纠偏，速度 ×0（可配） |
+| DISABLED | 模块关闭 / 配置非法 / 输入非法 | 透传或零 |
+| NO_PAIR | 没有稳定通道方向 | 横向 0，不猜墙 |
+| INSUFFICIENT_DATA | 有方向，但至少一侧无有效数据 | 旧纠偏按变化率回 0 |
+| NO_CORRIDOR | 两侧有数据但宽度/分类不满足 | 旧纠偏缓释到 0 |
+| TRACKING | 两侧可信且都新鲜 | PD 居中 |
+| DEGRADED | 可信但一侧不新鲜，或丢墙 hold 窗口内 | 新鲜度不足仍算 PD；丢墙则缓释旧值 |
+| TOO_CLOSE | 可信双墙且任一侧原始距离 <20 mm | 过近排斥，PD 旁路 |
 
-- 状态机是**唯一**墙体模式来源；LaneKeeper 不另维护“当前模式”。
-- 状态切换、组切换 -> `resetPid=true`，清积分/D 历史。
-- 主动转弯结束且航向稳定 -> `ACQUIRING`，等待重新确认墙体后再恢复。
-- 单侧/双侧 `<20 mm`：进入 **TOO_CLOSE**，不进入 ACQUIRING/FAULT：
-  - 单侧过近：向远离该侧修正；双侧过近：远离更近的一侧；
-  - 最小/最大排斥速度、速度比例、确认时间可配；
-  - 过近侧恢复到 `>=20 mm` 后，按正常双墙/单墙/无墙重新判定，不额外停车。
-- 单侧有墙但另一侧 **Unknown**：
-  - 若该侧是持续 9999/超量程的“无目标”证据，超时后可进入单墙/NO_WALL；
-  - 若是读取失败/未安装，或 Unknown 但没有 no-target 证据，则不把
-    未知侧当成无墙，先 ACQUIRING，超过 `sensorFaultTimeoutMs` 进入
-    SENSOR_FAULT；过近不算读取失败。
-- 双墙都 Present/可用但通道宽度不合理 -> ACQUIRING（不危险纠偏）。
-- `NO_WALL` 只表示“没有可观测近墙”，不生成定位/里程计；横向位置不确定性
-  由上游路径规划/后续定位模块管理。没有可靠里程计时不能保证长期精确居中。
-- IMU 无效时航向稳定判断只能退回基础 `omega` 指令；此时无法保证“实际旋转中
-  暂停墙距 PID”，应先把 IMU 校准好。
+- 丢墙后 `DEGRADED` 最多保持 `degradedHoldMs=150 ms`：
+  `wanted = lastCorrection × (1 - elapsed/hold)`；
+- 换对/重新获得可信双墙时清 PD 微分历史，避免 D 突跳；
+- 模式切换只用于诊断和复位，不改变巡航速度。
 
 ---
 
-## 6. 控制律、积分规则与限幅
+## 8. 横向控制
 
-### 6.1 双墙误差
-
-默认四顶点几何下左右对称；为了兼容安装不对称，先用参考垂距：
+### 8.1 误差
 
 ```
-L_left  = p_left·t  + d_left ·(a_left·t)
-L_right = p_right·(-t) + d_right·(a_right·(-t))
-error   = (L_right - L_left) / 2      // 向右为正
+center_error_mm = 0.5 * ((right_mm + q_right) - (left_mm + q_left))
 ```
 
-如果左右基准已对称校准，`L_right-L_left` 等价于原始 `dR-dL`，传感器半径项抵消。
-通道宽度合理性：`L_left + L_right` 必须在 `[minCorridorWidthM, maxCorridorWidthM]`
-内，否则视为可能来自墙角/不同墙段/物块，不进入双墙。
+- 正 = 车体偏左 / 右墙更远 -> 向右修正；
+- `q_left = p_left·t`，`q_right = p_right·(-t)`，用于兼容左右安装半径不一致；
+- 默认对称安装时等价于 `(right_mm - left_mm)/2`；
+- 误差使用**滤波后**距离；过近单侧排斥使用**原始**距离。
 
-### 6.2 单墙误差
-
-单墙目标使用**原始传感器距离** `targetWallMm=45`：
-
-```
-左墙：error = targetWallMm - leftDistanceMm     // 左太近 -> 正 -> 向右
-右墙：error = rightDistanceMm - targetWallMm     // 右太近 -> 负 -> 向左
-```
-
-三种模式统一使用“向右为正”的误差和同一个 PID 实现，避免复制三套代码。
-
-### 6.2b 过近排斥（TOO_CLOSE）
-
-`d < 20 mm` 时墙距已超出有效量程，不能继续用普通 PID 的目标误差，也不能
-直接停车。此时状态机进入 `TOO_CLOSE`，LaneKeeper 旁路墙距 PID，按最近墙
-产生排斥速度：
+### 8.2 PD
 
 ```
-单侧左过近：error = +(tooCloseMm - d_left)，corr 向行程右
-单侧右过近：error = -(tooCloseMm - d_right)，corr 向行程左
-双侧过近：  error = (d_right - d_left)/2，按两侧差居中
+correction = clamp(Kp*error + Kd*filtered(d error/dt),
+                   -0.14, +0.14)  // m/s
 ```
 
-只有单侧过近才强制最小排斥量；双侧都 <20 mm 时不再给“最小远离”，
-否则窄通道中心会反复左右抖。双侧等距时目标为 0，保持位置。
+默认：
 
-- 排斥量 = `clamp(gap * tooCloseGain, min, max)`，默认最小 0.06 m/s、最大 0.20 m/s；
-- 方向仍按“向右为正”和运动右法向映射到 `vx/vy`；
-- `tooCloseSpeedScale=0.35`，只减速，不把速度置 0；
-- 过近侧恢复到 `>=20 mm` 后，状态机按正常双墙/单墙/无墙重新判定；
-- 读取失败/未安装仍按 SENSOR_FAULT，不拿“过近”掩盖硬件故障。
+| 参数 | 值 |
+| --- | ---: |
+| `Kp` | 0.0010 |
+| `Ki` | 0 |
+| `Kd` | 0.000025 |
+| D 低通 alpha | 0.12 |
+| 输出限幅 | 0.14 m/s |
+| 横向变化率限幅 | 0.70 m/s² |
 
-### 6.3 最终命令
+- 首帧 D=0；换对/重新获得可信双墙/离开 TOO_CLOSE 时复位；
+- PD 输出先限幅，再按 `maxLateralAccelMps2 * dt` 做变化率限幅；
+- 目标为 0 时也按变化率回到 0，不瞬间归零（`NO_PAIR` 除外：
+  没有法向可用，横向 delta 直接为 0）。
+
+### 8.3 停车静摩擦补偿
+
+实车停车时，几毫米误差对应的 PD 输出只有几 mm/s，往往不足以克服静摩擦。
+LaneKeeper 增加一个**仅停车生效**的最小横向速度：
 
 ```
-corr = PID(error)                    // m/s，向右为正
-r    = (dY, -dX)                    // 运动右法向
-command.vx = (base.vx + corr*r.x) * speedScale
-command.vy = (base.vy + corr*r.y) * speedScale
-command.omega = base.omega          // 航向 PID 在 Chassis
+if (基础平移速度 < minDirectionSpeedMps &&
+    模式为 TRACKING/TOO_CLOSE &&
+    |center_error| > standstillDeadbandMm &&
+    |wanted| < standstillMinCorrectionMps)
+    wanted = sign(error) * standstillMinCorrectionMps
 ```
 
-- 纠偏不一定落在 `vy`：横移时可能落在 `vx`；
-- `speedScale` 综合状态机与前向安全，故障/前向障碍为 0 时整车停；
-- 横向纠偏有总限幅 `maxLateralCorrectionMps` 和变化率限幅
-  `maxLateralAccelMps2`；
-- 基础速度比例有 `maxSpeedScaleRatePerSec` 变化率限幅（故障/障碍除外）。
+- 默认 `standstillMinCorrectionMps=0.08 m/s`、`standstillDeadbandMm=3 mm`；
+- 有平移速度时仍用正常 PD，不叠加该最小速度；
+- 误差在死区内不施加，避免目标附近来回抖动；
+- 如果实车仍不动，逐步增大该值；如果目标附近抖动，增大死区或降低该值。
+- 主机闭环仿真（§12.4）：0.08 m/s 的停车距离约 13 mm，3 mm 死区会形成
+  ±9 mm 的极限环；仿真中死区 6–10 mm 才消除。实车必须先按 §11 验证静摩擦，
+  再定该值。
 
-### 6.4 积分门控（严格按任务书 §9）
+### 8.3 过近排斥
 
-只有以下条件全部满足才累计积分：
+原始有效距离 `<20 mm`：
 
-1. 状态是 DUAL_WALL / LEFT_WALL / RIGHT_WALL；
-2. 对应测量可用（Present + 滤波有效）；
-3. 不处于转弯/故障/无墙/ACQUIRING/TOO_CLOSE；
-4. `Ki != 0`；
-5. 参与控制的**原始**墙距严格 `<100 mm`。
+- 仅左侧过近：`wanted = +repulseMps`（向右远离）；
+- 仅右侧过近：`wanted = -repulseMps`（向左远离）；
+- 双侧都过近：`wanted = clamp(Kp*error, ±repulseMps)`，按差居中；
+- 默认 `repulseMps=0.10 m/s`；
+- PD 旁路，但仍受 `maxCorrectionMps` 和 `maxLateralAccelMps2` 限幅；
+- LaneKeeper 不减速、不停车；是否允许该动作由 SafetySupervisor/上层决定。
 
-- 双墙：左右原始距离都 <100；
-- 左墙：左原始距离 <100；
-- 右墙：右原始距离 <100；
-- 100–150 mm 滞回带：**冻结**积分（保留当前 I，不累计）；
-- 模式/组切换、进入无墙/转弯/故障/TOO_CLOSE：`reset()` **清零**积分和 D 历史；
-- `Ki=0`：积分状态清 0，不允许偷偷累积；
-- TOO_CLOSE 时墙距 PID 被旁路，P/I/D 为 0，横向输出是排斥量；
-- 输出饱和时条件积分抗饱和，撤销本帧积分增量。
+### 8.4 输出
 
-> 墙距 PID 与 IMU 航向 PID 的积分状态完全独立；侧墙模式变化不会清航向积分。
+```
+delta = -correction * t          // t 是运动左法向
+command.vx = base.vx + delta.x
+command.vy = base.vy + delta.y
+command.omega = base.omega
+```
 
-### 6.5 前向安全
-
-四路 ToF 在前后左右顶点。对当前运动方向，选择轴对齐度最高的一路：
-
-- 仅当 `a·d >= motionSafetyMinAxisAlignment=0.80` 时启用；
-- 原始有效距离 <= `motionStopMm=120`：立即停（速度比例 0）；
-- 120–300 mm：线性减速；>=300 mm：不限速；
-- 45° 斜向、该方向传感器未安装/失效/被遮挡时：**明确是感知盲区**，
-  本模块不限速，必须由全局规划/地图/速度策略补足。
+- 前进时 `t=(0,1)`，正修正 -> `vy` 减小（车体向右）；
+- 横移时 `t=(±1,0)`，修正落在 `vx`；
+- 倒车时左右传感器对调，但右法向映射保持一致；
+- **不乘速度比例，不修改基础速度大小**。
 
 ---
 
-## 7. 滤波与测量管理
+## 9. 前向安全（独立模块）
 
-- `RangeFilter`：3 点中值 + 一阶低通 + 跳变确认 + 无距离超时复位；
-- 中值抑制单点孤立异常；连续 `jumpConfirmSamples=2` 次跳变才接受新稳态；
-- 9999/无效值不进入中值/均值；
-- 相同数值连续出现有效（静止墙）；
-- 墙体存在性用**原始有效样本**判定；PID 用**滤波后距离**；
-- 短时丢数可用 hold 窗口内最近有效值；超过 `measurementHoldMs` 不可用；
-- 不允许用过期的墙距无限期继续驾驶。
+`SafetySupervisor` 在 LaneKeeper 之后、Chassis 之前：
 
-`LaneKeeperState` 同时暴露 raw / filtered / filterValid / usable / wall status，
-便于区分“测距失败、无墙、超时、正常离开”。
+```
+$D / ToF ──► 轴对齐障碍距离
+              │
+command ─────►├─ d_brake = v*T + v²/(2a) 约束
+              ▼
+         限速后的 command
+```
 
-### 7.1 实时分析 UI
+- 只对与运动方向轴对齐（`>=0.85`）且置信度 `>=8` 的 ToF 生效；
+- 使用 `reactionS=0.12`、`brakeMps2=1.2`、`tofReserveM=0.022`；
+- 只缩小 `vx/vy`，`omega` 保持；
+- `requireHeading=true` 时航向无效/不可信直接禁止平移；默认关闭，
+  避免 IMU 未校准时整车不能动；
+- 配置非法时 **fail-closed**；
+- 当前没有地图扫掠/未知挡板置信边界，不能单独作为实机零碰撞保证。
 
-`test/lane_plot.py` 读取 `$D`，同时显示两侧物理原始距离、控制侧滤波距离、
-墙距/过近误差、P/I/D、控制目标和实际横向修正，并写 CSV。TOO_CLOSE 时
-界面会提示“正在主动远离；不是故障停车”。三个曲线窗口都支持缩放/拖动/游标。
+---
+
+## 10. 在整车中的接入
+
+`src/main.cpp` 每个 20 ms 周期：
+
+```cpp
+base = radio.valid ? radio.getDriveCommand() : zero;
+const auto ranges = g_distance.toRangeSnapshot();
+g_lane.update(base, ranges, g_imu.toHeadingState(), dt);
+g_safety.update(g_lane.getState().command, ranges, g_imu.toHeadingState());
+g_chassis.setCommand(g_safety.getState().command);
+g_chassis.update(dt);
+```
+
+- `enableLaneAssist` 当前为 `true`（本次测试临时打开）；
+- `enableSafety` 当前为 `true`；
+- `disabled()` 同时 `lane.reset()` 和 `safety.reset()`；
+- 不新增线程、不直接写电机、不绕过 IK。
+
+---
+
+## 11. 遥测
+
+`$D` 末尾 30 个车道字段 + 3 个安全字段（详见 `docs/debug_log/07_调参工具.md` §7.5）：
+
+- 模式/原因/组/近壁掩码/有效掩码/新鲜掩码；
+- 控制侧滤波距离、中心误差、P/D、修正；
+- 四路滤波距离、左右 `NearClass`、通道宽度、质量、对分；
+- 物理左右原始距离、过近掩码；
+- 输出 `vx/vy/omega`；
+- 末尾 3 个安全层字段：限速比例、运动方向最近障碍、安全 flags。
+
+关键点：
+
+- `FAR_RETURN` 显示为“远”，不是“无墙”；
+- `leftMm/rightMm=-1` 才表示当前控制侧不可用；
+- `corridorWidthMm=-1` 表示几何不可用；
+- LaneKeeper 不再有 `speedScale/forwardScale` 字段。
+
+实时 UI：
 
 ```bash
 python3 test/lane_plot.py /dev/ttyACM1 15 --csv lane.csv
@@ -348,102 +349,110 @@ python3 test/lane_plot.py /dev/ttyACM1 --headless 10 --csv lane.csv
 
 ---
 
-## 8. 在整车中的接入
+## 12. 测试与验证状态
 
-`include/config/robot_config.hpp`：
+### 12.1 主机已执行
 
-```cpp
-bool enableLaneAssist = true;   // 本次测试临时打开；量产建议标定后按需打开
-```
-
-`src/main.cpp` 每个 20 ms 周期：
-
-```cpp
-base = radio.valid ? radio.getDriveCommand() : zero;
-g_lane.update(base, g_distance.toRangeSnapshot(),
-              g_imu.toHeadingState(), dt);
-g_chassis.setCommand(g_lane.getState().command);
-g_chassis.update(dt);
-```
-
-- LaneKeeper 的 `enable` 由 `syncVehicleConfig()` 从整车开关同步；
-- Chassis 的 `enableHeadingHold` 不受影响：航向 PID 仍在 Chassis 内工作；
-- 航向目标沿用 Chassis 既有“上电 5 s 锁存/主动旋转后重锁”策略；
-- `disabled()` 调用 `lane.reset()`，清滤波/墙体/PID/组/状态机历史；
-- 不新增线程、不直接写电机、不绕过 IK。
-
----
-
-## 9. 迷宫数据的使用
-
-`/home/jc/下载/maze_model.json`（SHA256
-`5bed05050cc36a2813fd2360d4b2c390e2eb847d7f7b316e62c63cf0fe10b601`）
-已复制到 `test/data/maze_model.json`，作为**唯一墙体真值**：
-
-- `scripts/gen_maze_fixture.py` 读取 JSON，生成
-  `tests/native/fixtures/maze_model.hpp`（16 条固定竖墙 + 11 条固定横墙 + 3 条活动隔板）；
-- `scripts/test_native.sh` 用 `--check` 阻止 JSON 与 fixture 漂移；
-- `tests/native/test_maze_fixture.cpp` 用真实墙体做射线：
-  - S 点四方向基准 `[front,right,back,left]=[0.675,0.225,0.225,0.675] m`；
-  - 45 cm 走廊 cell (7,3) 中左右原始距离约 45 mm；
-  - LaneKeeper 在真实走廊中完成双墙居中；
-  - M1/M2/M3 安装/拆除会改变对应射线。
-
-> 实时控制**不加载全局地图**：本模块是局部纠偏；全局地图/EKF/路径规划仍是后续独立模块。
-
----
-
-## 10. 测试与验证状态
-
-### 10.1 已执行（主机端）
-
-```bash
-bash scripts/test_native.sh
-```
+`bash scripts/test_native.sh`：
 
 | 套件 | 内容 |
 | --- | --- |
-| `test_distance_status` | PROS_ERR / 9999 / <20 / >2000 / 未安装分类 |
-| `test_wall_tracker` | 99/100/101、149/150/151、连续 3 次、滞回、9999、重复采样、stale |
-| `test_range_filter` | 中值、低通、跳变确认、9999 不混入、超时复位 |
-| `test_sensor_group_selector` | 前后=A/左右=B、前进/后退/横移/斜向/零速/转弯 |
-| `test_lane_state_machine` | 双/单/无墙、过近 TOO_CLOSE、组切换、转弯、故障恢复、积分权限、速度比例 |
-| `test_lane_pid` | P/I/D、积分门控、Ki=0、限幅、抗饱和、D 低通、复位 |
-| `test_lane_config` | 顶点布局、目标 45 mm、阈值/滤波/PID/状态机校验 |
-| `test_lane_keeper` | 双/单墙符号、映射、短墙、过近主动远离、故障、积分、限速、前向安全 |
-| `test_maze_fixture` | JSON 数据、S 点射线、真实 45 cm 走廊、活动隔板 |
+| `test_range_channel` | 99/100/150/151、MID 初始化、1.65 m 远距有效、丢帧保持/超时、跳变、重复时间戳、滤波 |
+| `test_sensor_group_selector` | 前进/后退/横移/斜向/换组/方向无效 |
+| `test_lane_state_machine` | TRACKING/DEGRADED/TOO_CLOSE/NO_CORRIDOR/INSUFFICIENT/NO_PAIR、hold 衰减 |
+| `test_lane_config` | v2.1 默认值、几何/阈值/PD/宽度校验 |
+| `test_lane_keeper` | 横向符号、横移/倒车选对、远距回波、宽度、方向记忆、无方向回退、停车最小速度、过近、丢墙缓释、无速度倍率 |
+| `test_safety_supervisor` | 前向/侧向制动、45° 盲区、低置信度、航向门控、fail-closed |
+| `test_maze_fixture` | 真实 maze_model.json 射线、45 cm 走廊双墙跟踪 |
+| `test_lane_pid` | P/D、限幅、D 低通、复位 |
 
-### 10.2 未执行/未验证（必须标注）
+### 12.2 未验证
 
-- 旧版（26 字段、未含 TOO_CLOSE）已烧录并短时采集到双墙模式；
-- **本版 TOO_CLOSE 连续远离、双墙走廊门控、30 字段遥测、`lane_plot.py` UI 尚未上机验证**；
-- 传感器实际安装位置/轴向/遮挡未实测；
-- PID 未整定；
-- 实际墙厚、反光、斜入射、轮子遮挡对测距的影响未测；
-- 双墙直行持续时间短，单墙/无墙/过近恢复的实车连续行为未验证；
-- 因此**不能**声称“实车车道保持通过”。首次上机按 §11 步骤执行，并把结果补入
-  `docs/TEST_PLAN.md`。
+- 传感器实际安装位置/轴向/遮挡；
+- `Kp/Kd` 未整定；
+- 通道宽度范围 `0.37–0.70 m` 未按实车/赛场重标；仿真实际近壁门限约
+  `0.40–0.66 m`（§12.4）；
+- 过近排斥在实车静摩擦下是否能动；
+- 安全层制动距离/传感器延迟未实测；
+- 未上机验证，不能声称实车车道保持通过。
+
+### 12.3 实车“不居中”排查顺序
+
+1. 用 `test/lane_plot.py` 或 `distance_monitor.py` 看 `$D`：
+   - `sideLeftRawMm/sideRightRawMm` 是否约 45/55 mm；
+   - `leftClass/rightClass` 是否为 `NEAR/MID`；
+   - `corridorWidthMm` 是否在约 400–660 mm（配置写 370–700，见 §12.4）；
+   - `lane_mode`、`fallbackPair`、`corr`、`safetyScale`。
+2. `lane_mode=NO_PAIR`：两侧还没有可信墙对。检查宽度/分类；停车时
+   `fallbackPair` 应变为 1。若始终为 0，检查 `layoutVerified` 前的安装几何、
+   传感器端口/轴向和 `corridorWidthMm`。
+3. `lane_mode=TRACKING` 且 `corr` 非 0，但车不动：
+   - 先看 `safetyScale` 是否为 1；为 0 说明安全层认为运动方向有障碍；
+   - 再看 `standstillMinCorrectionMps` 是否足以克服静摩擦，逐步增大；
+   - 检查 Chassis 的 slew/死区/轮子是否被卡。
+4. `lane_mode=TOO_CLOSE` 但车不动：另一侧距离可能已小于安全层
+   `tofReserveM`，SafetySupervisor 会直接把该方向速度压到 0。这是安全层
+   的保守行为，不应通过绕过安全层解决。
+5. `corr` 方向反了：优先检查 S1/S3 的物理左右映射和 `axisRad`，不要先改
+   PD 符号；方向符号错误会让车越修越偏。
+6. 目标附近来回抖：增大 `standstillDeadbandMm`，或降低
+   `standstillMinCorrectionMps`；不要用增大 Kp 来掩盖静摩擦问题。
+   主机闭环仿真显示默认 3 mm 死区会稳定极限环，6–10 mm 才消失（§12.4）。
+
+### 12.4 主机闭环仿真（v2.1，未上机）
+
+`sim/lane_keeping_sim.cpp` 直接编译本文件的 `LaneKeeper`，用
+`maze_model.json` 的 45 cm 走廊、`chassis_config.hpp` 的底盘参数和 50 Hz
+ToF 做闭环；运行 `bash sim/run_lane_keeping.sh`，完整结果见 `sim/README.md`。
+
+默认参数、σ=1 mm 下的结论（均为仿真，需按 §11 实车验证）：
+
+- 前进（B 组）巡航 20 mm 初偏能回到 0.6 mm，RMS 2.1 mm；
+- **停车 0.08/3 mm 会形成 ±9 mm、17 mm 峰峰值的极限环**（3 s 内 9 次换向；
+  噪声降到 0.3 mm 仍有 10 次）。0.08 m/s 的停车距离约 13 mm，大于 3 mm
+  死区；仿真中死区 6 mm 才停止振荡，10 mm 最终 ≤3 mm；
+- **航向误差**：P 控制稳态偏移 ≈ `v·tanθ/Kp`；前进 4°/0.4 m/s 就压到
+  TOO_CLOSE，6°/8° 车架角点理论侵入墙面；Kp 0.002–0.003 可降到约 14 mm，
+  但 8° 在 45 cm 走廊仍无解；
+- **平移转弯（A 组，主测试）**：车头朝北、沿东西走廊平移时，20 mm 初偏
+  在 1.67 s 短程内回到 3.6 mm，0.2 m/s 跑 3 s 后到 0.9 mm；停车同样有 ±9 mm 抖动
+  （与 A/B 无关），死区 10 mm 后消失；4°/0.3 m/s 为 17.2 mm（角点 9.3 mm），
+  0.4 m/s 为 22 mm（角点 4.6 mm），稳态公式仍为 `v·tanθ/Kp`；
+- **横穿走廊的横向平移后停车不会重新居中**：最后方向与所在走廊轴垂直时
+  （例如在南北走廊里向右横穿），A 组前后墙不可信，且 `pair.valid` 仍为
+  true，`fallbackPair` 不会执行。沿走廊平移（平移转弯）A 组可信，不受影响；
+- 左右/前后偏置 ±10 mm 直接变成约 8–12 mm 停车偏移（共模偏置互相抵消）；
+- 实际能进入 TRACKING 的走廊约 **0.40–0.66 m**，与配置/文档的
+  0.37–0.70 m 不一致；0.66 m 的 150 mm 端点被 `mm < detectMm` 排除；
+- `FAR -> MID` 不能恢复：0.70 m 收窄到 0.60 m 仍为 NO_CORRIDOR，只有
+  重新 `<100 mm`（NEAR）才能重置；
+- 20% ToF 丢帧、驶出走廊端都能安全保持/退出，不是问题。
 
 ---
 
-## 11. 待标定清单（TODO(CALIBRATE)）
+## 13. 待标定清单
 
 | 参数 | 位置 | 方法 | 当前值/状态 |
 | --- | --- | --- | --- |
 | `sensors[0..3].xM/yM` | `lane_config.hpp` | 量测距出射点到车体中心 | 0.1803 顶点占位，未验证 |
-| `sensors[0..3].axisRad` | `lane_config.hpp` | 量实际朝向 | 0 / ±π/2 / π 占位，未验证 |
-| `sensors[0..3].rangeSource` | `lane_config.hpp` | 确认逻辑通道↔快照索引 | 0/2/1/3（前/左/后/右），未验证 |
+| `sensors[0..3].axisRad` | `lane_config.hpp` | 量实际朝向 | 0/±π/2/π 占位，未验证 |
+| `sensors[0..3].rangeSource` | `lane_config.hpp` | 确认逻辑通道↔快照索引 | 0/2/1/3，未验证 |
+| 左右测距固定偏置（差值） | 无配置项 | 同一墙面互换/标定板比对 | 未标定；仿真 ±10 mm → ~10 mm 居中偏移 |
 | `layoutVerified` | `lane_config.hpp` | 完成上述后置 true | false |
-| `targetWallMm` | `lane_config.hpp` | 45 cm 通道/期望偏置 | 45 mm 占位 |
-| `wallPid` Kp/Kd | `lane_config.hpp` | 低速直线整定，先 Ki=0 | 0.0015/0.0003 占位 |
-| `min/maxCorridorWidthM` | `lane_config.hpp` | 实际通道宽度/墙角容忍 | 0.30–0.60 m 占位 |
-| `motionStopMm/motionSlowMm` | `lane_config.hpp` | 前向安全距离 | 120/300 mm 占位 |
-| `noWallTimeoutMs` / `sensorFaultTimeoutMs` | `lane_config.hpp` | 无目标确认 / 故障降级时间 | 120/500 ms 占位 |
-| `corridorOnly/corridorEnableMm` | `lane_config.hpp` | 仅双墙走廊启用 / 双侧距离门限 | true / 150 mm 占位 |
-| `standstillCenter/standstillMaxCorrectionMps` | `lane_config.hpp` | 停车自动居中 / 最大自动横移速度 | true / 0.08 m/s 占位 |
-| `tooCloseMm/tooCloseConfirmMs` | `lane_config.hpp` | 过近阈值 / 连续确认 | 20 mm / 20 ms 占位 |
-| `tooCloseGain/Min/Max/Scale` | `lane_config.hpp` | 过近排斥强度、最小/最大速度、速度比例 | 0.012 / 0.06 / 0.20 / 0.35 占位 |
-| `enableLaneAssist` | `robot_config.hpp` | 标定完成后打开 | false |
+| `channel.enterMm/exitMm/detectMm` | `lane_config.hpp` | 近壁分类 | 100/150/150 |
+| `channel.maxAgeMs/freshWindowMs` | `lane_config.hpp` | 实测刷新率/丢帧 | 180/42 ms |
+| `channel.lowPassAlpha/jumpMm/jumpConfirm` | `lane_config.hpp` | 噪声/跳变 | 0.45/60 mm/2 |
+| `state.min/maxCorridorWidthM` | `lane_config.hpp` | 实际通道宽度 | 0.37–0.70 m 占位（仿真实际 0.40–0.66，见 §12.4） |
+| `pd.kp/kd` | `lane_config.hpp` | 低速直线整定，先 Ki=0 | 0.0010/0.000025 占位 |
+| `state.maxCorrectionMps` | `lane_config.hpp` | 横向限幅 | 0.14 m/s 占位 |
+| `state.maxLateralAccelMps2` | `lane_config.hpp` | 横向变化率 | 0.70 m/s² 占位 |
+| `state.standstillMinCorrectionMps` | `lane_config.hpp` | 停车静摩擦补偿 | 0.08 m/s 占位 |
+| `state.standstillDeadbandMm` | `lane_config.hpp` | 停车居中死区 | 3 mm 占位（仿真会抖，见 §12.4） |
+| `state.repulseMps/tooCloseMm` | `lane_config.hpp` | 过近排斥 | 0.10 m/s / 20 mm |
+| `state.degradedHoldMs` | `lane_config.hpp` | 丢墙缓释 | 150 ms |
+| `state.minAxisAlignment` | `lane_config.hpp` | 斜向选对门限 | 0.82 |
+| `SafetyConfig` | `safety_config.hpp` | 实测制动距离/延迟 | 0.12 s/1.2 m/s²/22 mm 占位 |
+| `enableLaneAssist/enableSafety` | `robot_config.hpp` | 标定完成后决定 | true/true（测试临时） |
 
-> 标定后请同步更新 `docs/车辆配置.md`、`docs/TEST_PLAN.md` 和本表，
-> 并把“未验证”改成实际的测试条件与结果。
+> 标定后同步更新 `docs/车辆配置.md`、`docs/TEST_PLAN.md` 和本表，
+> 并把“未验证”改成实际测试条件与结果。

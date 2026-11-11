@@ -28,3 +28,6 @@ __pycache__/
 *.tmp
 *.bak
 .tmp-pi-*
+
+# --- 归档 / 打包产物 ---
+*.zip
