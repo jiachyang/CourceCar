@@ -21,6 +21,7 @@
 #include <cstdio>
 
 #include "bringup/friction_test.hpp"
+#include "bringup/heading_reference_test.hpp"
 #include "config/robot_config.hpp"
 #include "core/types.hpp"
 #include "diag/telemetry.hpp"
@@ -48,7 +49,7 @@ safety::SafetySupervisor g_safety;
 // 遥测输出器：只读上面各模块的状态快照。
 diag::Telemetry g_telemetry;
 
-/// 把整车开关同步到模块（运行时开关，改 g_vehicle 即生效）。
+/// 把整车编译期默认开关同步到模块（当前没有外部运行时配置入口）。
 void syncVehicleConfig() {
     g_chassis.enableDrive       = g_vehicle.enableChassisDrive;
     g_chassis.enableHeadingHold = g_vehicle.enableImuHeading;
@@ -108,6 +109,7 @@ void initialize() {
     syncVehicleConfig();
 
     // 遥测只读上述状态快照；指针在模块生命周期内保持稳定。
+    g_chassis.stop();
     diag::TelemetrySources sources;
     sources.chassis  = &g_chassis.getState();
     sources.imu      = &g_imu.getState();
@@ -116,6 +118,9 @@ void initialize() {
     sources.lane     = &g_lane.getState();
     sources.safety   = &g_safety.getState();
     g_telemetry.init(diag::makeDefaultTelemetryConfig(), sources);
+    if (g_vehicle.enableHeadingReferenceTest && g_vehicle.enableImu) {
+        bringup::prepareHeadingReference(g_imu, g_telemetry);
+    }
 }
 
 void disabled() {
@@ -128,11 +133,19 @@ void disabled() {
 void competition_initialize() {}
 
 void autonomous() {
+    if (g_vehicle.enableHeadingReferenceTest) {
+        bringup::runHeadingReferenceTest(g_chassis, g_imu, g_telemetry);
+        return;
+    }
     // 暂无自主任务：保留点动自检，方便架空车轮验证方向（T-01~T-06）。
     bringup::runStaticTestSequence(g_chassis);
 }
 
 void opcontrol() {
+    if (g_vehicle.enableHeadingReferenceTest) {
+        bringup::runHeadingReferenceTest(g_chassis, g_imu, g_telemetry);
+        return;
+    }
     // 台架模式：只跑静摩擦标定，不进入遥控循环（开关见 bringup/friction_test.hpp）。
     if (bringup::kFrictionTestEnabled) {
         bringup::runFrictionTest(g_chassis, g_imu);

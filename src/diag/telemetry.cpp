@@ -19,6 +19,20 @@ namespace {
 // 顺序即输出顺序；与 test/pid_tune.py 的 FIELDS（去掉开头的 ms）一一对应。
 // 增删字段必须同步 test/pid_tune.py 与 docs/debug_log/07_调参工具.md。
 // 单位：速度 mm/s、角速度 mrad/s、角度 mrad、轮速 milli-rpm、PID 参数 ×1000。
+// $H：ms 后的 11 个字段，与 heading_reference_monitor.py 的 FIELDS 对齐。
+#define DIAG_HEADING_FIELDS(X) \
+    X(imu_valid, is.valid ? 1 : 0) \
+    X(calibrating, is.calibrating ? 1 : 0) \
+    X(bias_ready, is.biasMeasured ? 1 : 0) \
+    X(reference_ready, is.startup.referenceReady ? 1 : 0) \
+    X(relative_valid, is.startup.relativeValid ? 1 : 0) \
+    X(rotation_mrad, static_cast<int>(is.rotationRad * 1000.0)) \
+    X(initial_mrad, static_cast<int>(is.startup.initialHeadingRad * 1000.0)) \
+    X(relative_mrad, static_cast<int>(is.startup.relativeHeadingRad * 1000.0)) \
+    X(gyro_mrad_s, static_cast<int>(is.angularVelocityRadPerSec * 1000.0)) \
+    X(still_ms, static_cast<int>(is.startup.stillMs)) \
+    X(latched_ms, static_cast<int>(is.startup.latchedMs))
+
 #define DIAG_TUNE_FIELDS(X)                                                     \
     X(tvx, static_cast<int>(c.applied.vx * 1000.0))                             \
     X(tvy, static_cast<int>(c.applied.vy * 1000.0))                             \
@@ -130,6 +144,17 @@ void printTuneFrame(const chassis::ChassisState &c, const imu::ImuState &is,
     for (const int value : fields) {
         frame.add(value);
     }
+    frame.flush();
+}
+
+// $H：独立诊断帧，不改变已有 $P/$D 的字段或含义。
+void printHeadingReferenceFrame(const imu::ImuState& is, std::uint32_t nowMs) {
+    FrameBuffer frame("$H", nowMs);
+#define X(name, expr) expr,
+    const int fields[] = {DIAG_HEADING_FIELDS(X)};
+#undef X
+    static_assert(sizeof(fields) / sizeof(fields[0]) == 11, "$H field count");
+    for (const int value : fields) frame.add(value);
     frame.flush();
 }
 
@@ -303,10 +328,16 @@ void Telemetry::init(const TelemetryConfig &config,
     lastTuneMs_ = 0;
     lastDistanceMs_ = 0;
     lastPortScanMs_ = 0;
+    lastHeadingReferenceMs_ = 0;
 }
 
 void Telemetry::update() {
     const std::uint32_t now = pros::millis();
+
+    if (config_.enableHeadingReference && sources_.imu != nullptr &&
+        due(now, lastHeadingReferenceMs_, config_.headingReferencePeriodMs)) {
+        printHeadingReferenceFrame(*sources_.imu, now);
+    }
 
     if (config_.enableTune && sources_.chassis != nullptr &&
         sources_.imu != nullptr && sources_.radio != nullptr &&
