@@ -5,12 +5,14 @@
 1) $P：src/diag/telemetry.cpp 的 DIAG_TUNE_FIELDS ↔ test/pid_tune.py 的 FIELDS；
 2) $D 车道/安全追加字段数：telemetry.cpp 的 kLaneFieldCount /
    kSafetyFieldCount ↔ test/distance_monitor.py 的 LANE_FIELDS /
-   SAFETY_FIELDS 长度。
+   SAFETY_FIELDS 长度；CSV 表头唯一性。
+3) $H 固定航向验收帧的字段顺序与解析器。
 
 用法：python3 scripts/check_telemetry_schema.py（scripts/test_native.sh 会调用）
 """
 import pathlib
 import re
+import runpy
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -64,6 +66,21 @@ def field_counts():
 
 
 def main():
+    # $H 固定航向验收帧的顺序与主机解析必须一致。
+    heading = runpy.run_path(str(ROOT / "test" / "heading_reference_monitor.py"))
+    block = CPP.read_text(encoding="utf-8").split("#define DIAG_HEADING_FIELDS(X)", 1)[1]
+    block = block.split("#define DIAG_TUNE_FIELDS(X)", 1)[0]
+    heading_names = re.findall(r"^\s*X\(([A-Za-z_]\w*),", block, re.M)
+    if heading["FIELDS"] != ["ms"] + heading_names:
+        sys.exit("error: $H firmware/host field order mismatch")
+    values = [5000, 1, 0, 1, 1, 1, 785, 785, 0, 0, 3000, 5000]
+    parsed = heading["parse"]("$H," + ",".join(map(str, values)))
+    if parsed != dict(zip(heading["FIELDS"], values)):
+        sys.exit("error: $H parser values mismatch")
+    for bad in ("$P,1,2", "$H,1,2", "$H," + ",".join(["x"] * 12)):
+        if heading["parse"](bad) is not None:
+            sys.exit("error: $H parser accepted malformed frame")
+
     fw = firmware_fields()
     host = host_fields()
     if not host or host[0] != "ms":
@@ -92,8 +109,24 @@ def main():
         print("  SAFETY_FIELDS:         ", len(safety_names))
         return 1
 
+    monitor = runpy.run_path(str(MONITOR_PY))
+    header = monitor["csv_header"]()
+    if len(header) != len(set(header)):
+        sys.exit("error: distance CSV contains duplicate column names")
+    expected_count = 3 + 5 * len(monitor["SIDES"]) + lane_count + safety_count
+    if len(header) != expected_count:
+        sys.exit("error: distance CSV header length does not match payload")
+    for raw, lane in (("valid_mask", "lane_valid_mask"),
+                      ("left_mm", "lane_left_mm"),
+                      ("right_mm", "lane_right_mm")):
+        if header[3 + 5 * len(monitor["SIDES"]) + lane_names.index(raw)] != lane:
+            sys.exit("error: distance CSV lane column alias is incorrect: " + raw)
+        if raw not in header[:3 + 5 * len(monitor["SIDES"])]:
+            sys.exit("error: distance CSV raw column missing: " + raw)
+
     print("telemetry schema tests: ALL PASS (%d $P fields, %d $D lane fields, "
-          "%d safety fields)" % (len(fw), lane_count, safety_count))
+          "%d safety fields, %d $H fields)" %
+          (len(fw), lane_count, safety_count, len(heading_names)))
     return 0
 
 

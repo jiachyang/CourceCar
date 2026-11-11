@@ -1,5 +1,50 @@
 # test/ — 调参 / 传感器测试工具
 
+## 固定初始航向验收（当前阶段）
+
+当前 `include/config/robot_config.hpp` 的
+`VehicleConfig::enableHeadingReferenceTest=true`，driver/autonomous 均只采集 IMU，不运行
+遥控/居中/点动，不下发运动命令。编译和主机测试已通过。
+2026-11-11 已完成固定基准、相对角响应和约 20 秒静态稳定性的基础实机验证，
+本轮结束；部分边界仍待验证，详见
+[测试报告](../docs/debug_log/10_2026-11-11_初始航向基准实机测试报告.md)。
+当前保留此测试固件，不会自动恢复电机驱动；下一阶段见
+[编码器计划](../docs/encoder_validation_plan.md)。
+
+这是编译期开关，修改后须重新编译上传。初始化同步等待只在该测试开关和
+`enableImu` 同时开启时执行；关闭测试开关后，正常模式初始化不等待 IMU。
+采样周期和等待上限位于 `include/bringup/heading_reference_config.hpp`，
+通过 `HeadingReferenceTestConfig` 传入 bringup 流程，默认 20ms/10000ms。
+
+```bash
+source ~/Desktop/pros-env.sh
+cd ~/Desktop/CourceCar
+pros make
+pros upload
+python3 test/heading_reference_monitor.py /dev/ttyACM1 --csv heading_reference.csv
+```
+
+先开启监视脚本，再从 V5 主控启动/重新启动程序，可记录初始化全过程；
+不要并行运行 `pros terminal` 或其他监视脚本。CSV 文件已存在时工具会报错，
+请用新文件名，防止覆盖实测记录。Ctrl+C 结束并保存。
+
+1. 启动后保持整车静止至少 8s。正常应先 `bias=1`，再在启动至少 5s 后
+   `ready=1 valid=1`；`relative` 接近 0°，`initial` 允许包含固定的 IMU 安装角。
+   若 IMU 较晚就绪或中途转动，锁存时刻会推迟。
+2. 锁存后手动慢转车体约 90°，再转回原方向：`initial` 与 `lock` 保持不变，
+   `relative` 随转动变化，回原方向应接近 0°；符号与实际转向需实测核对。
+3. 有比赛控制设备时禁用/重新使能：零点与锁存时刻保持不变。
+   没有设备时跳过这一项；停止程序再启动属于重启，会重新建立零点。
+4. 另录一份，在启动校准结束但未锁存时缓慢转动，确认不会边转边锁存，
+   停下后等待连续采样完成。物理校准期间不要故意移动车辆。
+
+CSV：`ms,imu_valid,calibrating,bias_ready,reference_ready,relative_valid,rotation_mrad,`
+`initial_mrad,relative_mrad,gyro_mrad_s,still_ms,latched_ms`。
+角度/角速度原始单位为 mrad/mrad/s，终端显示转换成度/度每秒。
+`ready=1` 只表示零点已保存；当前相对角可用还需 `valid=1`。
+旋转静止判据：原始角速度 ≤2°/s、采样窗口角变化 ≤0.5°、相邻样本间隔 ≤100ms；
+它不能检测纯平移，测试时仍须整车静止。验收通过后再讨论恢复驱动和下一功能。
+
 ## 文件
 
 - `pid_tune.py` — 纯标准库（Tk）实时曲线，读 V5 串口 `$P` 帧，画三自由度
@@ -254,15 +299,23 @@ front_mm,front_conf,front_size,front_vel_mm_s,front_type,
 rear_mm,rear_conf,rear_size,rear_vel_mm_s,rear_type,
 left_mm,left_conf,left_size,left_vel_mm_s,left_type,
 right_mm,right_conf,right_size,right_vel_mm_s,right_type,
-lane_mode,lane_group,near_mask,valid_mask,
-left_mm,right_mm,center_err_mm,
+lane_mode,lane_group,near_mask,lane_valid_mask,
+lane_left_mm,lane_right_mm,center_err_mm,
 lane_p_mm_s,lane_i_mm_s,lane_d_mm_s,lane_corr_mm_s,
 out_vx_mm_s,out_vy_mm_s,out_omega_mrad_s,
 filter_s0_mm,filter_s1_mm,filter_s2_mm,filter_s3_mm,fresh_mask,
 left_class,corridor_width_mm,lane_reason,
 quality_milli,right_class,pair_score_milli,lane_flags,
+side_left_raw_mm,side_right_raw_mm,pid_target_mm_s,too_close_mask,
 safety_scale_milli,safety_nearest_mm,safety_flags
 ```
+
+CSV 列名唯一：`left_mm/right_mm` 为物理左右传感器原始距离，
+`lane_left_mm/lane_right_mm` 为按运动方向选择的车道左右滤波距离；
+`valid_mask` 为原始四路有效位，`lane_valid_mask` 为车道通道有效位。
+这只影响新 CSV 的表头，不改变串口协议、数据顺序或实时显示。
+旧 CSV 不会自动更新；若表头有重名列，应按列位置读取，避免 `DictReader`
+覆盖原始值。
 
 ### 快速验收
 

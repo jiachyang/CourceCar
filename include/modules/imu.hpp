@@ -17,6 +17,7 @@
 
 #include "core/types.hpp"
 #include "imu/imu_config.hpp"
+#include "imu/startup_heading.hpp"
 #include "pros/imu.hpp"
 
 namespace imu {
@@ -40,6 +41,7 @@ struct ImuState {
     bool biasMeasured = false;              ///< 零偏/漂移是否已确定（手动常量或测量完成）
     std::int32_t statusRaw = 0;             ///< 原始 ImuStatus（诊断用：0=ready,19=calibrating,255=error）
     std::uint32_t timestampMs = 0;          ///< 数据更新时间 [ms]
+    StartupHeadingState startup{};         ///< 固定初始航向，与底盘临时保持目标独立
 };
 
 /**
@@ -78,6 +80,7 @@ public:
     bool isReady() const;
 
 private:
+    void updateSensor();
     ImuConfig config_{};
     std::optional<pros::Imu> device_;
     ImuState state_{};
@@ -89,15 +92,10 @@ private:
     bool calibrationStarted_ = false;
     bool initialized_ = false;
 
-    // ---- 静置漂移补偿 ----
-    double gyroBiasDps_ = 0.0;       ///< 本次运行使用的 Z 角速度零偏 [deg/s]
-    double gyroDriftDps_ = 0.0;      ///< 本次运行使用的角度漂移率 [deg/s]
-    bool biasMeasured_ = false;      ///< 是否已确定零偏/漂移
-    double biasSumDps_ = 0.0;        ///< 角速度测量累加
-    double biasRotStartDeg_ = 0.0;   ///< 角度漂移测量起点
-    std::uint32_t biasSampleCount_ = 0;
-    std::uint32_t biasStartMs_ = 0;  ///< 测量窗口起点
-    std::uint32_t biasRefMs_ = 0;    ///< rotation 漂移补偿的时间基准
+    StartupHeading startup_;
+    double rawRotationDeg_ = 0.0;
+    double rawGyroDps_ = 0.0;
+    std::uint32_t initMs_ = 0;
 };
 
 }  // namespace imu

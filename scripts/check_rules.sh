@@ -116,7 +116,7 @@ fi
 
 echo "== 纯逻辑与平台解耦 =="
 
-pure_files="src/chassis/kinematics.cpp src/chassis/heading_controller.cpp src/radio/input_mapping.cpp include/core/types.hpp include/core/math_util.hpp include/core/range_types.hpp include/chassis/chassis_config.hpp include/chassis/kinematics.hpp include/chassis/heading_controller.hpp include/imu/imu_config.hpp include/distance/distance_config.hpp include/distance/range_status.hpp include/radio/input_mapping.hpp include/lane/*.hpp include/modules/lane_keeper.hpp src/lane/*.cpp src/modules/lane_keeper.cpp include/safety/*.hpp include/modules/safety_supervisor.hpp src/safety/*.cpp src/modules/safety_supervisor.cpp"
+pure_files="include/bringup/heading_reference_config.hpp include/imu/startup_heading.hpp src/imu/startup_heading.cpp src/chassis/kinematics.cpp src/chassis/heading_controller.cpp src/radio/input_mapping.cpp include/core/types.hpp include/core/math_util.hpp include/core/range_types.hpp include/chassis/chassis_config.hpp include/chassis/kinematics.hpp include/chassis/heading_controller.hpp include/imu/imu_config.hpp include/distance/distance_config.hpp include/distance/range_status.hpp include/radio/input_mapping.hpp include/lane/*.hpp include/modules/lane_keeper.hpp src/lane/*.cpp src/modules/lane_keeper.cpp include/safety/*.hpp include/modules/safety_supervisor.hpp src/safety/*.cpp src/modules/safety_supervisor.cpp"
 m=$(grep -nE 'pros::|#include "pros/' $pure_files | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|//)' || true)
 if [ -n "$m" ]; then
     fail_msg "纯逻辑文件引入了 PROS（将无法主机端单测）"

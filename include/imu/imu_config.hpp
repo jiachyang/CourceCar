@@ -66,6 +66,13 @@ struct ImuConfig {
     double gyroDriftDps                     = kGyroDriftDps;
     bool useManualGyroBias                  = kUseManualGyroBias;
     std::uint32_t gyroBiasMeasureMs         = kGyroBiasMeasureMs;
+    // 初始化航向基准：程序启动至少 5s、零偏已测、旋转静止才锁存。
+    std::uint32_t referenceDelayMs = 5000;
+    std::uint32_t referenceStillMs = 500;
+    std::uint32_t startupMaxSampleGapMs = 100;
+    double startupMaxGyroDps = 2.0;
+    double startupMaxAngleChangeDeg = 0.5;
+    double gyroDriftDeadbandDps = 0.02;  ///< 静置漂移率诊断噪声门限 [deg/s]
 };
 
 /// 默认 IMU 配置。

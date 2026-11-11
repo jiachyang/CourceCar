@@ -1,6 +1,6 @@
 /**
  * @file config/robot_config.hpp
- * @brief 整车配置入口：汇聚各模块配置 + 整车级运行时开关。
+ * @brief 整车配置入口：汇聚各模块配置 + 整车级编译期默认开关。
  *
  * 分层（ARCH-010）：
  *   - 模块级硬件/控制真值  → 各模块的 *_config.hpp（chassis / imu / radio）
@@ -18,11 +18,15 @@
 namespace config {
 
 /**
- * @brief 整车级运行时配置（ARCH-009）：模块单独启停，无需重新编译。
+ * @brief 整车级编译期默认配置（ARCH-009/010）。
  *
- * main 在初始化时读取，并在每个周期同步给对应模块。
+ * main 在初始化时读取，并在每个周期同步给对应模块；当前没有外部修改入口，
+ * 用户修改这些默认值后须重新编译上传，不能称为已实现运行时配置。
  */
 struct VehicleConfig {
+    /// 本轮只验收固定初始航向。true：driver/autonomous 均只采集 IMU；
+    /// false：恢复原有控制流程，initialize 不执行航向测试的等待循环。
+    bool enableHeadingReferenceTest = true;
     bool enableChassisDrive = true;   ///< 底盘驱动模块（关=不发任何电机指令）
     bool enableImu          = true;   ///< IMU 模块：已装（端口 6），开启校准与读取
     bool enableImuHeading   = true;   ///< IMU 航向保持：开启（Kp 初值 1.0，待整定）

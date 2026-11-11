@@ -117,6 +117,18 @@ SAFETY_FIELDS = [
     "safety_scale_milli", "safety_nearest_mm", "safety_flags",
 ]
 
+
+def csv_header():
+    """CSV 为车道重名字段加前缀；串口字段和解析器内部键保持不变。"""
+    header = ["ms", "inst_mask", "valid_mask"]
+    for _, _, name in SIDES:
+        header += [f"{name}_mm", f"{name}_conf", f"{name}_size",
+                   f"{name}_vel_mm_s", f"{name}_type"]
+    aliases = {"valid_mask": "lane_valid_mask",
+               "left_mm": "lane_left_mm", "right_mm": "lane_right_mm"}
+    header += [aliases.get(name, name) for name in LANE_FIELDS]
+    return header + SAFETY_FIELDS
+
 # ANSI
 CLR = "\x1b[2J\x1b[H"
 HIDE = "\x1b[?25l"
@@ -597,13 +609,7 @@ def main():
 
     csv_f = open(csv_path, "w", newline="") if csv_path else None
     if csv_f:
-        header = ["ms", "inst_mask", "valid_mask"]
-        for _, _, csv_name in SIDES:
-            header += [f"{csv_name}_mm", f"{csv_name}_conf",
-                       f"{csv_name}_size", f"{csv_name}_vel_mm_s",
-                       f"{csv_name}_type"]
-        header += LANE_FIELDS + SAFETY_FIELDS
-        csv_f.write(",".join(header) + "\n")
+        csv_f.write(",".join(csv_header()) + "\n")
 
     frames = 0
     last_frame = None

@@ -13,6 +13,31 @@
 
 ## 1. 项目总体架构
 
+2026-11-11 分步验收：当前 `VehicleConfig::enableHeadingReferenceTest=true`。
+仅当该测试开关与 `enableImu` 同时为 true，`initialize()` 才在初始化各模块和遥测后，
+调用 `prepareHeadingReference()` 同步采样，默认最多 10s；
+driver/autonomous 均进入 `runHeadingReferenceTest()`：停止电机，只更新 IMU 和遥测。
+下图正常控制链暂不执行。开关集中在 `include/config/robot_config.hpp`，为编译期开关；
+改回 false 并重编译后恢复原控制链，且不执行测试初始化等待。
+等待上限/采样周期由 `bringup::HeadingReferenceTestConfig` 注入，唯一默认值位于
+`include/bringup/heading_reference_config.hpp`（10000ms/20ms），不散落在流程代码里。
+
+`Imu` 内部新增纯逻辑 `imu::StartupHeading`（`include/imu/startup_heading.hpp`、
+`src/imu/startup_heading.cpp`）：保存独立于底盘 PID 的固定零点 ψ₀，输出
+`ImuState::startup`（就绪、相对角、旋转静止时长、锁存时刻）。
+有效连续静止样本满 2s 测零偏；旋转、角度变化超限或采样中断重启测量窗口。
+从 `Imu::init()` 起至少 5s、零偏已测且静止窗口至少 500ms 才锁存；
+不满足条件继续等。只检测旋转，不能证明车辆没有平移。
+IMU 工程角与 `core::HeadingState` 语义保持不变，新增相对角仅作本轮验收，
+尚未用于控制。停车/disabled 不清零 ψ₀；重启程序或显式重新校准才清零。
+锁存后 IMU 数据无效时保留 ψ₀，`relativeValid=false`；恢复后继续相对于原零点。
+若 IMU 自身重启导致角度基准变化，需重启程序重新初始化，不自动猜测新零点。
+遥测在 `diag/telemetry.cpp` 新增独立 `$H`，原 `$P/$D/$S` 协议不变。
+本阶段软件验证完成；2026-11-11 固定基准、转动响应、约 20 秒静态稳定性已实测，
+本轮结项，部分初始化/禁用边界仍待验证。报告见
+[初始航向实机测试报告](debug_log/10_2026-11-11_初始航向基准实机测试报告.md)。
+编码器/ToF 融合与新版居中不在本轮范围，下一项仅规划编码器读取验证。
+
 重构目标：**main 负责组织，模块负责能力**。机器人被拆为三个控制模块
 （Radio / IMU / Chassis）、一个测距读取模块（DistanceArray）、一个局部横向
 车道保持模块（LaneKeeper）和一个安全限速模块（SafetySupervisor）；
@@ -389,9 +414,15 @@ initialize():
     safety.init(makeDefaultSafetyConfig())
     if (enableImu) imu.startCalibration()
     syncVehicleConfig()
+    chassis.stop()
     telemetry.init(makeDefaultTelemetryConfig(), sources)  // 只绑定状态快照指针
+    if (enableHeadingReferenceTest && enableImu):
+        bringup::prepareHeadingReference(imu, telemetry)  // 有界同步等待，仅测试模式
 
-opcontrol() 每 20 ms:
+opcontrol()（enableHeadingReferenceTest=true，优先于其他模式）:
+    bringup::runHeadingReferenceTest(chassis, imu, telemetry)  // 停电机，只采集 IMU
+
+opcontrol() 正常模式每 20 ms:
     imu.update()                       // 仅 enableImu 时
     distance.update()                  // 四路测距，独立于底盘控制
     radio.update()
@@ -403,7 +434,7 @@ opcontrol() 每 20 ms:
                   imu.toHeadingState())                  // 唯一安全限速
     chassis.setCommand(safety.getState().command)
     chassis.update(dt)                 // 航向 PID + IK + 电机
-    telemetry.update()                 // $P / $D / $S，内部按各自周期限频
+    telemetry.update()                 // $P / $D / $S / $H，内部按各自周期限频
 
 disabled():
     chassis.stop()
@@ -411,6 +442,9 @@ disabled():
     safety.reset()                     // 清安全限速状态
 
 autonomous():
+    if (enableHeadingReferenceTest):
+        bringup::runHeadingReferenceTest(chassis, imu, telemetry)
+        return
     bringup::runStaticTestSequence(chassis)   // T-01~T-06 点动自检（无自主任务时）
 
 opcontrol()（台架模式，kFrictionTestEnabled=true）:
@@ -418,7 +452,8 @@ opcontrol()（台架模式，kFrictionTestEnabled=true）:
 ```
 
 - 模块实例在 `main.cpp` 文件作用域创建（稳定生命周期），初始化顺序显式、无动态注册。
-- 所有耗时操作（IMU 校准）均非阻塞。
+- IMU 的 `reset(false)` 非阻塞；正常模式的 `initialize()` 不等待校准或初始零点。
+- 仅航向验收模式在 `initialize()` 做配置上限内的同步采样；超时返回后，在测试循环继续等待。
 - `main` 只保留调用顺序与生命周期；帧格式在 `diag`，标定流程在 `bringup`。
 
 ---

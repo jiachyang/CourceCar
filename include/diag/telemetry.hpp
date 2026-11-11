@@ -11,6 +11,7 @@
  *   $P  调参帧    默认 20 Hz  目标/实测/PID 内部量/参数
  *   $D  四路测距  默认 20 Hz  距离/置信度/大小/速度/设备类型 + 车道保持状态
  *   $S  端口扫描  默认 1 Hz   1~21 号 Smart Port 的 VEXos 设备类型
+ *   $H  初始航向  默认 10 Hz  校准/零偏/锁存/相对航向
  *
  * 主机侧解析脚本：test/pid_tune.py、test/distance_monitor.py。
  * 字段顺序是固件与脚本之间的隐式契约，变更时必须同步脚本；
@@ -37,6 +38,8 @@ struct TelemetryConfig {
     std::uint32_t distancePeriodMs = 50;     ///< 20 Hz
     bool enablePortScan = true;              ///< $S 端口扫描
     std::uint32_t portScanPeriodMs = 1000;   ///< 1 Hz
+    bool enableHeadingReference = true;       ///< $H 初始航向实机验收
+    std::uint32_t headingReferencePeriodMs = 100;  ///< 10 Hz
 };
 
 /// 默认遥测配置。
@@ -76,6 +79,7 @@ private:
     std::uint32_t lastTuneMs_ = 0;
     std::uint32_t lastDistanceMs_ = 0;
     std::uint32_t lastPortScanMs_ = 0;
+    std::uint32_t lastHeadingReferenceMs_ = 0;
 };
 
 }  // namespace diag

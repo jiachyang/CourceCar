@@ -101,5 +101,11 @@ python3 scripts/gen_maze_fixture.py --check
     -o "$OUT/test_maze_fixture"
 "$OUT/test_maze_fixture"
 
-# 14) 遥测字段契约：固件 DIAG_TUNE_FIELDS ↔ test/pid_tune.py 的 FIELDS
+# 14) 静止零偏、固定初始航向、延迟/失效/跨零
+"$CXX" "${CXXFLAGS[@]}" \
+    tests/native/test_startup_heading.cpp src/imu/startup_heading.cpp \
+    -o "$OUT/test_startup_heading"
+"$OUT/test_startup_heading"
+
+# 15) 遥测字段契约
 python3 scripts/check_telemetry_schema.py
