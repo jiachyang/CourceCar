@@ -11,6 +11,7 @@
 """
 import pathlib
 import re
+import runpy
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -91,6 +92,21 @@ def main():
         print("  固件 kSafetyFieldCount:", safety_count)
         print("  SAFETY_FIELDS:         ", len(safety_names))
         return 1
+
+    monitor = runpy.run_path(str(MONITOR_PY))
+    header = monitor["csv_header"]()
+    if len(header) != len(set(header)):
+        sys.exit("error: distance CSV contains duplicate column names")
+    expected_count = 3 + 5 * len(monitor["SIDES"]) + lane_count + safety_count
+    if len(header) != expected_count:
+        sys.exit("error: distance CSV header length does not match payload")
+    for raw, lane in (("valid_mask", "lane_valid_mask"),
+                      ("left_mm", "lane_left_mm"),
+                      ("right_mm", "lane_right_mm")):
+        if header[3 + 5 * len(monitor["SIDES"]) + lane_names.index(raw)] != lane:
+            sys.exit("error: distance CSV lane column alias is incorrect: " + raw)
+        if raw not in header[:3 + 5 * len(monitor["SIDES"])]:
+            sys.exit("error: distance CSV raw column missing: " + raw)
 
     print("telemetry schema tests: ALL PASS (%d $P fields, %d $D lane fields, "
           "%d safety fields)" % (len(fw), lane_count, safety_count))

@@ -254,15 +254,23 @@ front_mm,front_conf,front_size,front_vel_mm_s,front_type,
 rear_mm,rear_conf,rear_size,rear_vel_mm_s,rear_type,
 left_mm,left_conf,left_size,left_vel_mm_s,left_type,
 right_mm,right_conf,right_size,right_vel_mm_s,right_type,
-lane_mode,lane_group,near_mask,valid_mask,
-left_mm,right_mm,center_err_mm,
+lane_mode,lane_group,near_mask,lane_valid_mask,
+lane_left_mm,lane_right_mm,center_err_mm,
 lane_p_mm_s,lane_i_mm_s,lane_d_mm_s,lane_corr_mm_s,
 out_vx_mm_s,out_vy_mm_s,out_omega_mrad_s,
 filter_s0_mm,filter_s1_mm,filter_s2_mm,filter_s3_mm,fresh_mask,
 left_class,corridor_width_mm,lane_reason,
 quality_milli,right_class,pair_score_milli,lane_flags,
+side_left_raw_mm,side_right_raw_mm,pid_target_mm_s,too_close_mask,
 safety_scale_milli,safety_nearest_mm,safety_flags
 ```
+
+CSV 列名唯一：`left_mm/right_mm` 为物理左右传感器原始距离，
+`lane_left_mm/lane_right_mm` 为按运动方向选择的车道左右滤波距离；
+`valid_mask` 为原始四路有效位，`lane_valid_mask` 为车道通道有效位。
+这只影响新 CSV 的表头，不改变串口协议、数据顺序或实时显示。
+旧 CSV 不会自动更新；若表头有重名列，应按列位置读取，避免 `DictReader`
+覆盖原始值。
 
 ### 快速验收
 
